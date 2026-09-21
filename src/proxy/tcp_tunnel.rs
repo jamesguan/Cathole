@@ -35,6 +35,8 @@ const WARM_POOL: usize = 256;
 struct PairingHub {
     waiting_data: Mutex<HashMap<u16, VecDeque<oneshot::Sender<TcpStream>>>>,
     waiting_visitors: Mutex<HashMap<u16, VecDeque<TcpStream>>>,
+    /// Services that keep an idle warm pool (not TLS backends).
+    warmable: Mutex<HashSet<u16>>,
     /// Reliable create requests; never drop under accept bursts.
     create: mpsc::UnboundedSender<u16>,
 }
@@ -44,6 +46,7 @@ impl PairingHub {
         Self {
             waiting_data: Mutex::new(HashMap::new()),
             waiting_visitors: Mutex::new(HashMap::new()),
+            warmable: Mutex::new(HashSet::new()),
             create,
         }
     }
@@ -52,10 +55,15 @@ impl PairingHub {
         let _ = self.create.send(service);
     }
 
-    fn seed_warm(&self, service: u16) {
+    fn enable_warm(&self, service: u16) {
+        self.warmable.lock().unwrap().insert(service);
         for _ in 0..WARM_POOL {
             self.request_create(service);
         }
+    }
+
+    fn is_warmable(&self, service: u16) -> bool {
+        self.warmable.lock().unwrap().contains(&service)
     }
 
     fn visitor_arrived(&self, service: u16, tcp: TcpStream) {
@@ -67,8 +75,9 @@ impl PairingHub {
             .and_then(VecDeque::pop_front)
         {
             let _ = tx.send(tcp);
-            // Refill the warm slot that was just consumed.
-            self.request_create(service);
+            if self.is_warmable(service) {
+                self.request_create(service);
+            }
             return;
         }
         self.waiting_visitors
@@ -77,7 +86,7 @@ impl PairingHub {
             .entry(service)
             .or_default()
             .push_back(tcp);
-        // One new data channel for this waiting visitor.
+        // On-demand data channel for this waiting visitor.
         self.request_create(service);
     }
 
@@ -373,7 +382,11 @@ where
             tracing::info!(service = %name, "service ready");
             match listener {
                 Bound::Tcp(listener) => {
-                    hub.seed_warm(sid);
+                    // Do not warm-pool TLS backends: an idle TCP to :3443 dies in
+                    // handshake timeout, and the next visitor then sees SSL EOF.
+                    if name != "https" {
+                        hub.enable_warm(sid);
+                    }
                     tcp_listen(listener, service, sid, cfg, hub, events).await
                 }
                 Bound::Udp(socket) => udp_listen(socket, sid, events).await,
@@ -474,9 +487,7 @@ where
 async fn open_data_channel(cfg: Arc<Side>, service_id: u16) -> Result<()> {
     let mut names: Vec<_> = cfg.services.keys().cloned().collect();
     names.sort();
-    let name = names
-        .get(service_id as usize)
-        .context("unknown service")?;
+    let name = names.get(service_id as usize).context("unknown service")?;
     let service = &cfg.services[name];
     ensure!(
         service.kind == Kind::Tcp,

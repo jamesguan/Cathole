@@ -29,3 +29,19 @@ local_addr = "backend:3000"
 nodelay = true
 retry_interval = 1
 
+[client.services.tcp_echo]
+type = "tcp"
+local_addr = "backend:3001"
+nodelay = true
+retry_interval = 1
+
+[client.services.udp_echo]
+type = "udp"
+local_addr = "backend:3002"
+retry_interval = 1
+
+[client.services.https]
+type = "tcp"
+local_addr = "backend:3443"
+nodelay = true
+retry_interval = 1

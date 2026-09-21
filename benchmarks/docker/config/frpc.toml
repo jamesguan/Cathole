@@ -20,3 +20,29 @@ remotePort = 8080
 transport.useEncryption = true
 transport.useCompression = false
 
+[[proxies]]
+name = "tcp-echo-benchmark"
+type = "tcp"
+localIP = "backend"
+localPort = 3001
+remotePort = 8081
+transport.useEncryption = true
+transport.useCompression = false
+
+[[proxies]]
+name = "udp-echo-benchmark"
+type = "udp"
+localIP = "backend"
+localPort = 3002
+remotePort = 8082
+transport.useEncryption = true
+transport.useCompression = false
+
+[[proxies]]
+name = "https-benchmark"
+type = "tcp"
+localIP = "backend"
+localPort = 3443
+remotePort = 8443
+transport.useEncryption = true
+transport.useCompression = false

@@ -53,7 +53,7 @@ Optional tuning variables:
 ```sh
 THREADS=16 DURATION=20 STRESS_DURATION=30 SAMPLES=3 \
 SATURATION_STEPS="64 256 1000 2000" \
-TESTS="correctness,latency,saturation,stress,stream,seek" \
+TESTS="correctness,latency,saturation,stress,stream,seek,tcp_packets,udp_packets,https" \
 VIDEO_BYTES=10737418240 ./benchmarks/docker/run.sh
 ```
 
@@ -65,7 +65,7 @@ and `results/latest.md`, copies ranked results to `BENCHMARK-RESULTS.md` and
 `BENCHMARK-RESULTS.json` at the repository root, and replaces the
 generated-results block in the project README.
 
-## The four tests
+## The tests
 
 1. **Correctness:** ten requests each to `/`, `/64k`, and `/1m` through every
    path. It verifies the exact hello body and exact binary response lengths.
@@ -78,7 +78,12 @@ generated-results block in the project README.
 5. **Emby-style stream:** one HTTP/1.1 GET of a generated 10 GiB `video/mp4`
    body on a single connection (`curl` to `/dev/null`). Optional `seek` runs 16
    scattered 8 MiB `Range` requests. Tune with `VIDEO_BYTES` and `TESTS`.
-
+6. **TCP echo packets:** raw TCP echo (not HTTP) — 64-byte RTT samples plus
+   parallel bulk mirrored transfer. Public port `8081` → backend `3001`.
+7. **UDP echo packets:** fixed-rate 200-byte UDP echo probes with loss accounting.
+   Public port `8082/udp` → backend `3002/udp`.
+8. **HTTPS requests:** TLS terminated on the backend (self-signed); proxies
+   forward TCP. Public port `8443` → backend `3443`.
 Every timed path uses `wrk --latency` and records the full latency distribution
 plus connect/read/write/status/timeout errors. Each target is warmed for two
 seconds, then measured alone. Host scripts start only that stack, run wrk, stop

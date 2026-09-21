@@ -11,7 +11,7 @@ export DURATION=${DURATION:-10}
 export STRESS_DURATION=${STRESS_DURATION:-10}
 export SAMPLES=${SAMPLES:-1}
 export SATURATION_STEPS=${SATURATION_STEPS:-"64 256 1000"}
-export TESTS=${TESTS:-"correctness,latency,saturation,stress,stream"}
+export TESTS=${TESTS:-"correctness,latency,saturation,stress,stream,tcp_packets,udp_packets,https"}
 export VIDEO_BYTES=${VIDEO_BYTES:-10737418240}
 export STREAM_TIMEOUT=${STREAM_TIMEOUT:-900}
 
@@ -36,7 +36,8 @@ trap cleanup EXIT
 docker compose --profile benchmark build
 docker compose --profile benchmark down --volumes --remove-orphans
 mkdir -p results
-python - <<'PY' || : > results/raw.jsonl
+if [[ ${PRESERVE_WRK:-0} == 1 ]]; then
+python - <<'PY'
 import json, pathlib
 src = pathlib.Path("results/latest.json")
 out = pathlib.Path("results/raw.jsonl")
@@ -50,7 +51,10 @@ if src.exists():
 out.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 print("preserved", len(lines), "prior wrk samples")
 PY
-
+else
+  : > results/raw.jsonl
+  echo 'starting with empty raw.jsonl (set PRESERVE_WRK=1 to keep prior wrk samples)'
+fi
 docker compose up -d backend
 
 run_target() {
@@ -58,6 +62,8 @@ run_target() {
   shift
   echo "========== Isolated target: $name =========="
   stop_proxies
+  # Fresh backend per target so TLS/echo sockets from prior stacks cannot accumulate.
+  docker compose up -d --force-recreate backend
   if (($# > 0)); then
     docker compose up -d --force-recreate "$@"
   fi
