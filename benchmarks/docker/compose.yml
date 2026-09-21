@@ -131,19 +131,16 @@ services:
       THREADS: ${THREADS:-16}
       DURATION: ${DURATION:-10}
       STRESS_DURATION: ${STRESS_DURATION:-10}
-      SAMPLES: ${SAMPLES:-3}
+      SAMPLES: ${SAMPLES:-1}
       SATURATION_STEPS: ${SATURATION_STEPS:-64 256 1000}
+      WRK_TIMEOUT: ${WRK_TIMEOUT:-30s}
       CATHOLE_REVISION: ${CATHOLE_REVISION:-working-tree}
       DOCKER_VERSION: ${DOCKER_VERSION:-unknown}
+      TARGET: ${TARGET:-}
+      GENERATE_REPORT: ${GENERATE_REPORT:-0}
     volumes:
       - ./results:/results
-      - ../../README.md:/workspace/README.md
-    depends_on:
-      - backend
-      - rathole-client
-      - frp-client
-      - cathole-client
-      - wireguard-client
+      - ../..:/workspace
     networks:
       - public
     ulimits: *benchmark-ulimits

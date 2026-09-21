@@ -415,40 +415,88 @@ or:
 
 The harness, topology, pinned versions, tunable settings, and interpretation
 guidance are documented in [benchmarks/docker](benchmarks/docker/README.md).
-Each run writes machine-readable JSON and automatically replaces the block below.
+Targets are started one at a time so idle proxy stacks cannot skew CPU or
+network results. Each run writes ranked `BENCHMARK-RESULTS.md` /
+`BENCHMARK-RESULTS.json` at the repository root and replaces the block below.
 
 <!-- docker-benchmark-results:start -->
 # Docker comparison benchmark results
 
-Run at: 2026-09-21T03:36:17Z
+Run at: 2026-09-21T04:06:24Z
 
-| Test | Target | Connections | Requests/s | Transfer MiB/s | p50 ms | p99 ms | Errors |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| latency | cathole | 64 | 16560 | 2.25 | 3.57 | 10.6 | 128 |
-| latency | direct | 64 | 331734 | 45.24 | 0.17 | 0.43 | 0 |
-| latency | frp | 64 | 9219 | 1.25 | 6.92 | 8.89 | 128 |
-| latency | rathole | 64 | 112694 | 15.36 | 0.63 | 1.1 | 252 |
-| latency | wireguard | 64 | 38748 | 5.28 | 1.63 | 2.11 | 128 |
-| saturation | cathole | 64 | 3448 | 216.14 | 18.9 | 33.85 | 128 |
-| saturation | cathole | 256 | 4203 | 263.8 | 60.69 | 105.18 | 512 |
-| saturation | cathole | 1000 | 3735 | 234.12 | 269.93 | 424.74 | 1878 |
-| saturation | direct | 64 | 226389 | 14180.4 | 0.23 | 0.82 | 0 |
-| saturation | direct | 256 | 305825 | 19156.09 | 0.66 | 2.32 | 0 |
-| saturation | direct | 1000 | 314957 | 19728.09 | 2.27 | 8.9 | 0 |
-| saturation | frp | 64 | 4173 | 261.63 | 17.44 | 20.47 | 128 |
-| saturation | frp | 256 | 3785 | 237.78 | 65.88 | 228.96 | 512 |
-| saturation | frp | 1000 | 3327 | 211.46 | 259.69 | 1595.1 | 1295 |
-| saturation | rathole | 64 | 2433 | 152.89 | 43.81 | 48.35 | 256 |
-| saturation | rathole | 256 | 11348 | 712.59 | 25.5 | 48.3 | 1024 |
-| saturation | rathole | 1000 | 47027 | 2948.5 | 16.88 | 244.45 | 3961 |
-| saturation | wireguard | 64 | 818 | 51.36 | 62.94 | 431.57 | 119 |
-| saturation | wireguard | 256 | 805 | 51.16 | 294.94 | 947.14 | 317 |
-| saturation | wireguard | 1000 | 770 | 51.19 | 647.17 | 1865.6 | 2113 |
-| stress | cathole | 1000 | 36822 | 5.02 | 25.06 | 53.21 | 757 |
-| stress | direct | 1000 | 859711 | 117.24 | 0.88 | 4.98 | 1849 |
-| stress | frp | 1000 | 8620 | 1.17 | 39.45 | 346.86 | 403 |
-| stress | rathole | 1000 | 198436 | 27.06 | 4.75 | 67.75 | 1931 |
-| stress | wireguard | 1000 | 48454 | 6.6 | 23.32 | 38.35 | 3964 |
+Stacks were started and measured **one target at a time**. Other reverse-proxy and VPN containers were stopped during each run so CPU, sockets, and the Docker bridge were not shared.
+
+## Overall ranking
+
+| Rank | Target | Score | Throughput | Request rate | Latency | Reliability | Correctness |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | direct | 5 | #1 | #1 | #1 | #1 | PASS |
+| 2 | rathole | 3.75 | #2 | #2 | #2 | #3 | PASS |
+| 3 | wireguard | 2.55 | #5 | #3 | #3 | #2 | PASS |
+| 4 | cathole | 2.34 | #3 | #4 | #4 | #4 | PASS |
+| 5 | frp | 1.35 | #4 | #5 | #5 | #5 | PASS |
+
+Score weights: saturation throughput 35%, small-response request rate 20%, p50 latency 20%, error rate 25%. A correctness failure ranks last on reliability.
+
+## Speed: saturated 64 KiB transfer
+
+| Rank | Target | Peak MiB/s | At connections | p50 ms | p99 ms |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | direct | 21767.41 | 1000 | 2.11 | 8.39 |
+| 2 | rathole | 2877.49 | 1000 | 15.79 | 238.31 |
+| 3 | cathole | 268.42 | 256 | 57.79 | 109.69 |
+| 4 | frp | 251.72 | 64 | 16.69 | 19.55 |
+| 5 | wireguard | 55.85 | 256 | 274.68 | 884.05 |
+
+## Speed: small-response request rate
+
+| Rank | Target | Latency RPS | p50 ms | p99 ms | Stress RPS |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | direct | 333729 | 0.17 | 0.46 | 907892 |
+| 2 | rathole | 105698 | 0.61 | 1.09 | 200713 |
+| 3 | wireguard | 39729 | 1.58 | 2.17 | 44256 |
+| 4 | cathole | 17239 | 3.43 | 10.31 | 40363 |
+| 5 | frp | 9479 | 6.73 | 8.48 | 9571 |
+
+## Reliability
+
+| Rank | Target | Correctness | Error rate | Timeouts | Connect | Read | Write | Status |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | direct | PASS | 0% | 982 | 0 | 0 | 0 | 0 |
+| 2 | wireguard | PASS | 0.02% | 220 | 0 | 0 | 0 | 0 |
+| 3 | rathole | PASS | 0.02% | 1044 | 0 | 0 | 0 | 0 |
+| 4 | cathole | PASS | 0.1% | 698 | 0 | 0 | 0 | 0 |
+| 5 | frp | PASS | 0.14% | 425 | 0 | 0 | 0 | 0 |
+
+## wrk results
+
+| Test | Target | Connections | Requests/s | Transfer MiB/s | p50 ms | p95 ms | p99 ms | Errors |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| latency | cathole | 64 | 17239 | 2.35 | 3.43 | 7.49 | 10.31 | 0 |
+| latency | direct | 64 | 333729 | 45.51 | 0.17 | 0.31 | 0.46 | 0 |
+| latency | frp | 64 | 9479 | 1.29 | 6.73 | 7.86 | 8.48 | 0 |
+| latency | rathole | 64 | 105698 | 14.41 | 0.61 | 0.9 | 1.09 | 61 |
+| latency | wireguard | 64 | 39729 | 5.41 | 1.58 | 1.86 | 2.17 | 0 |
+| saturation | cathole | 64 | 3831 | 240.05 | 17.38 | 27.19 | 32.02 | 64 |
+| saturation | cathole | 256 | 4277 | 268.42 | 57.79 | 90.32 | 109.69 | 0 |
+| saturation | cathole | 1000 | 3919 | 249.29 | 249.98 | 332.84 | 381.75 | 0 |
+| saturation | direct | 64 | 245974 | 15407.15 | 0.23 | 0.55 | 0.83 | 62 |
+| saturation | direct | 256 | 313260 | 19621.78 | 0.64 | 1.53 | 2.22 | 0 |
+| saturation | direct | 1000 | 347515 | 21767.41 | 2.11 | 5.94 | 8.39 | 920 |
+| saturation | frp | 64 | 4014 | 251.72 | 16.69 | 18.4 | 19.55 | 64 |
+| saturation | frp | 256 | 3947 | 248.07 | 62.55 | 69.71 | 205.36 | 0 |
+| saturation | frp | 1000 | 3446 | 219.07 | 251.28 | 812.41 | 1462.03 | 0 |
+| saturation | rathole | 64 | 2077 | 130.51 | 43.86 | 48.06 | 48.33 | 0 |
+| saturation | rathole | 256 | 9779 | 614.05 | 42.42 | 48.04 | 48.72 | 0 |
+| saturation | rathole | 1000 | 45871 | 2877.49 | 15.79 | 59.71 | 238.31 | 983 |
+| saturation | wireguard | 64 | 832 | 52.24 | 62.4 | 137.97 | 446.46 | 0 |
+| saturation | wireguard | 256 | 879 | 55.85 | 274.68 | 594.59 | 884.05 | 220 |
+| saturation | wireguard | 1000 | 791 | 52.53 | 725.75 | 2899.55 | 5088.85 | 0 |
+| stress | cathole | 1000 | 40363 | 5.5 | 23.43 | 42.44 | 53.06 | 634 |
+| stress | direct | 1000 | 907892 | 123.81 | 0.81 | 2.78 | 4.42 | 0 |
+| stress | frp | 1000 | 9571 | 1.3 | 39.89 | 1116.55 | 5647.65 | 361 |
+| stress | rathole | 1000 | 200713 | 27.37 | 4.64 | 7.97 | 52.25 | 0 |
+| stress | wireguard | 1000 | 44256 | 6.03 | 22.18 | 26.05 | 27.51 | 0 |
 
 Correctness performs 30 requests per target and verifies the hello response plus exact 64 KiB and 1 MiB bodies.
 

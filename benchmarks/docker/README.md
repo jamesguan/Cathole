@@ -52,9 +52,12 @@ THREADS=16 DURATION=20 STRESS_DURATION=30 SAMPLES=3 \
 SATURATION_STEPS="64 256 1000 2000" ./benchmarks/docker/run.sh
 ```
 
-The default three-sample run takes about thirteen minutes after images are built. It writes
-`results/latest.json` and `results/latest.md`, and replaces the generated-results
-block in the project README.
+The default one-sample run takes about six minutes after images are built. Each
+target is started **alone**: other reverse-proxy and VPN containers are stopped
+so they cannot steal CPU, sockets, or bridge bandwidth. It writes
+`results/latest.json` and `results/latest.md`, copies ranked results to
+`BENCHMARK-RESULTS.md` and `BENCHMARK-RESULTS.json` at the repository root, and
+replaces the generated-results block in the project README.
 
 ## The four tests
 
@@ -68,9 +71,11 @@ block in the project README.
 4. **Stress:** the requested shape, `wrk -c 1000 -t 16 -d 10s`, against the hello
    endpoint. Errors and p50/p95/p99 latency are recorded with request rate.
 
-Every timed path receives a two-second warmup. Paths run sequentially so they do
-not steal CPU or bandwidth from one another, and target order rotates between the
-three samples. The Markdown table reports medians; JSON retains every raw sample.
+Every timed path uses `wrk --latency` and records the full latency distribution
+plus connect/read/write/status/timeout errors. Each target is warmed for two
+seconds, then measured alone. Host scripts start only that stack, run wrk, stop
+it, and then move on. The Markdown tables report medians; JSON retains every raw
+sample and the ranking scores.
 
 ## Interpreting results
 
