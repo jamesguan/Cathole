@@ -32,20 +32,27 @@ byte relay with reusable 256 KiB buffers (`write_chunk` / `read_chunk`). There
 is no per-stream Noise handshake and no application framing of ordinary TCP
 data.
 
-## TCP/Noise mux
+## TCP/Noise control and data channels
 
-After session authentication, frames are Noise-sealed length-prefixed records:
+After session authentication on the **control** connection, the control mux
+carries only UDP and signaling frames (Noise-sealed, length-prefixed):
 
 | Type | Layout |
 | --- | --- |
-| OPEN (1) | `u32` stream ID, `u16` service ID |
-| DATA (2) | `u32` stream ID, payload |
-| FIN (3) | `u32` stream ID |
 | UDP (4) | `u16` service, `u64` flow, payload |
 | HEARTBEAT (5) | empty |
+| CREATE_DATA (6) | `u16` service ID |
 
-Send and receive Noise nonces are independent; the halves are not behind a
-shared mutex. Ciphertext buffers are reused from a per-worker pool.
+Each public TCP visitor uses a dedicated **data channel**: the client opens a
+new TCP connection, completes the same Noise handshake, and sends a three-byte
+payload `0xD0 || service_id` instead of registration JSON. After `ok`, both
+sides relay local TCP bytes as Noise-framed chunks (up to ~60 KiB plaintext)
+with no stream IDs. The client keeps a warm pool of data channels; the server
+sends `CREATE_DATA` when the pool is empty. Service IDs are zero-based indexes
+into the registration list sorted by service name.
+
+Send and receive Noise nonces are independent per connection. Ciphertext
+buffers are reused from a per-worker pool.
 
 ## UDP
 

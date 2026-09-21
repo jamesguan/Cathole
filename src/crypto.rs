@@ -391,6 +391,53 @@ pub async fn relay_raw(tcp: TcpStream, mut send: SendStream, mut recv: RecvStrea
     Ok(())
 }
 
+/// Max plaintext per Noise frame on a dedicated TCP data channel.
+pub const DATA_CHUNK: usize = 60 * 1024;
+
+/// Bidirectional relay of a local TCP socket over a Noise-framed tunnel stream.
+pub async fn relay_noise<S>(tcp: TcpStream, tunnel: S, aead: SessionAead) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut tun_r, mut tun_w) = tokio::io::split(tunnel);
+    let (mut tx, mut rx) = aead.split();
+    let (mut local_r, mut local_w) = tcp.into_split();
+    let up = async {
+        let mut plain = crate::buf::take_vec(DATA_CHUNK);
+        plain.resize(DATA_CHUNK, 0);
+        let mut cipher = crate::buf::take_vec(DATA_CHUNK + 16);
+        loop {
+            let n = local_r.read(&mut plain).await?;
+            if n == 0 {
+                crate::buf::give_vec(plain);
+                crate::buf::give_vec(cipher);
+                tokio::io::AsyncWriteExt::shutdown(&mut tun_w).await?;
+                return Ok::<_, anyhow::Error>(());
+            }
+            tx.seal(&plain[..n], &mut cipher)?;
+            write_frame(&mut tun_w, &cipher).await?;
+        }
+    };
+    let down = async {
+        let mut cipher = crate::buf::take_vec(MAX_FRAME);
+        let mut plain = crate::buf::take_vec(MAX_FRAME);
+        loop {
+            let Some(()) = read_frame_into(&mut tun_r, &mut cipher).await? else {
+                local_w.shutdown().await?;
+                crate::buf::give_vec(cipher);
+                crate::buf::give_vec(plain);
+                return Ok::<_, anyhow::Error>(());
+            };
+            rx.open(&cipher, &mut plain)?;
+            local_w.write_all(&plain).await?;
+        }
+    };
+    match tokio::try_join!(up, down) {
+        Ok(((), ())) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Explicit nonces permit unordered UDP delivery. Replay state changes only
 /// after authentication succeeds. The state is never reused across sessions.
 pub struct DatagramCrypto {

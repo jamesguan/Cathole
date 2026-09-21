@@ -9,49 +9,37 @@ use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use rustls::pki_types::ServerName;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-const OPEN: u8 = 1;
-const DATA: u8 = 2;
-const FIN: u8 = 3;
-const UDP: u8 = 4;
 const HEARTBEAT: u8 = 5;
-const CHUNK: usize = 32 * 1024;
+const UDP: u8 = 4;
+const CREATE_DATA: u8 = 6;
+const DATA_OPEN: u8 = 0xD0;
+const WARM_POOL: usize = 32;
 
 enum Bound {
     Tcp(TcpListener),
     Udp(Arc<UdpSocket>),
 }
 enum Incoming {
-    Tcp {
-        service: u16,
-        stream: TcpStream,
-    },
     Udp {
         service: u16,
         peer: SocketAddr,
         payload: Bytes,
         socket: Arc<UdpSocket>,
     },
-}
-enum StreamMsg {
-    Data(Bytes),
-    Fin,
 }
 struct Flow {
     service: u16,
@@ -68,6 +56,65 @@ impl Flows {
     fn expire(&mut self, idle: Duration) {
         self.by_id.retain(|_, f| f.touched.elapsed() < idle);
         self.by_peer.retain(|_, id| self.by_id.contains_key(id));
+    }
+}
+
+/// Pairs public visitor sockets with client-opened Noise data channels.
+struct PairingHub {
+    waiting_data: Mutex<HashMap<u16, VecDeque<oneshot::Sender<TcpStream>>>>,
+    waiting_visitors: Mutex<HashMap<u16, VecDeque<TcpStream>>>,
+    create: mpsc::Sender<u16>,
+}
+
+impl PairingHub {
+    fn new(create: mpsc::Sender<u16>) -> Self {
+        Self {
+            waiting_data: Mutex::new(HashMap::new()),
+            waiting_visitors: Mutex::new(HashMap::new()),
+            create,
+        }
+    }
+
+    fn visitor_arrived(&self, service: u16, tcp: TcpStream) {
+        if let Some(tx) = self
+            .waiting_data
+            .lock()
+            .unwrap()
+            .get_mut(&service)
+            .and_then(VecDeque::pop_front)
+        {
+            let _ = tx.send(tcp);
+            let _ = self.create.try_send(service);
+            return;
+        }
+        self.waiting_visitors
+            .lock()
+            .unwrap()
+            .entry(service)
+            .or_default()
+            .push_back(tcp);
+        let _ = self.create.try_send(service);
+    }
+
+    async fn take_visitor(&self, service: u16) -> Result<TcpStream> {
+        if let Some(tcp) = self
+            .waiting_visitors
+            .lock()
+            .unwrap()
+            .get_mut(&service)
+            .and_then(VecDeque::pop_front)
+        {
+            return Ok(tcp);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.waiting_data
+            .lock()
+            .unwrap()
+            .entry(service)
+            .or_default()
+            .push_back(tx);
+        rx.await
+            .map_err(|_| anyhow::anyhow!("data channel cancelled before visitor arrived"))
     }
 }
 
@@ -93,7 +140,7 @@ impl<W: AsyncWrite + Unpin> MuxOut<W> {
         self.framed
             .extend_from_slice(&(self.cipher.len() as u32).to_be_bytes());
         self.framed.extend_from_slice(&self.cipher);
-        self.writer.write_all(&self.framed).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut self.writer, &self.framed).await?;
         Ok(())
     }
 }
@@ -147,6 +194,29 @@ fn configure_tunnel_socket(stream: &TcpStream, tcp: &crate::config::TcpCompat) -
     Ok(())
 }
 
+fn data_open_payload(service: u16) -> [u8; 3] {
+    let mut p = [DATA_OPEN, 0, 0];
+    p[1..].copy_from_slice(&service.to_be_bytes());
+    p
+}
+
+fn parse_data_open(payload: &[u8]) -> Option<u16> {
+    if payload.len() == 3 && payload[0] == DATA_OPEN {
+        Some(u16::from_be_bytes(payload[1..3].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+struct HubGuard;
+impl Drop for HubGuard {
+    fn drop(&mut self) {
+        *ACTIVE_HUB.lock().unwrap() = None;
+    }
+}
+
+static ACTIVE_HUB: Mutex<Option<Arc<PairingHub>>> = Mutex::new(None);
+
 pub async fn run_server(
     cfg: Arc<Side>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -158,7 +228,11 @@ pub async fn run_server(
         transport = %cfg.transport.kind,
         "TCP server listening"
     );
-    let slots = Arc::new(Semaphore::new(cfg.transport.quic.max_connections));
+    let slots = Arc::new(Semaphore::new(
+        (cfg.transport.quic.max_streams as usize)
+            .saturating_add(cfg.transport.quic.max_connections)
+            .max(64),
+    ));
     let mut sessions = JoinSet::new();
     loop {
         tokio::select! {
@@ -173,7 +247,7 @@ pub async fn run_server(
                 sessions.spawn(async move {
                     let _permit = permit;
                     if let Err(e) = async {
-                        tokio::time::timeout(SESSION_LIFETIME, accept_session(cfg, tcp)).await??;
+                        tokio::time::timeout(SESSION_LIFETIME, accept_connection(cfg, tcp)).await??;
                         Ok::<_, anyhow::Error>(())
                     }
                     .await
@@ -189,14 +263,119 @@ pub async fn run_server(
     Ok(())
 }
 
-async fn accept_session(cfg: Arc<Side>, tcp: TcpStream) -> Result<()> {
+async fn accept_connection(cfg: Arc<Side>, tcp: TcpStream) -> Result<()> {
     configure_tunnel_socket(&tcp, &cfg.transport.tcp)?;
     if cfg.transport.kind == "tls" {
         let tls = TlsAcceptor::from(Arc::new(transport::rustls_server(&cfg.transport.quic)?));
-        server_session(cfg, tls.accept(tcp).await?).await
+        dispatch_incoming(cfg, tls.accept(tcp).await?).await
     } else {
-        server_session(cfg, tcp).await
+        dispatch_incoming(cfg, tcp).await
     }
+}
+
+async fn dispatch_incoming<S>(cfg: Arc<Side>, mut stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut aead, payload) =
+        crypto::receive_tcp_session(&mut stream, &cfg.transport.noise).await?;
+    if let Some(service) = parse_data_open(&payload) {
+        crypto::confirm_session(&mut aead, &mut stream).await?;
+        let hub = ACTIVE_HUB
+            .lock()
+            .unwrap()
+            .clone()
+            .context("data channel without active control session")?;
+        let visitor = hub.take_visitor(service).await?;
+        crypto::relay_noise(visitor, stream, aead).await
+    } else {
+        server_control(cfg, stream, aead, payload).await
+    }
+}
+
+async fn server_control<S>(
+    cfg: Arc<Side>,
+    mut stream: S,
+    mut aead: crypto::SessionAead,
+    payload: Vec<u8>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let reg: Registration = serde_json::from_slice(&payload)?;
+    ensure!(
+        reg.version == REGISTRATION_VERSION
+            && !reg.services.is_empty()
+            && reg.services.len() <= 256,
+        "invalid registration"
+    );
+    let mut names = HashSet::new();
+    let mut definitions = Vec::new();
+    for offer in reg.services {
+        ensure!(names.insert(offer.name.clone()), "duplicate service");
+        let service = cfg
+            .services
+            .get(&offer.name)
+            .context("service authentication failed")?;
+        ensure!(
+            offer.kind == service.kind
+                && bool::from(cfg.token(service).as_bytes().ct_eq(offer.token.as_bytes())),
+            "service authentication failed"
+        );
+        definitions.push((offer.name, service.clone()));
+    }
+    let mut bound = Vec::new();
+    for (name, service) in definitions {
+        let addr = service.bind_addr.as_ref().unwrap();
+        let listener = match service.kind {
+            Kind::Tcp => Bound::Tcp(TcpListener::bind(addr).await?),
+            Kind::Udp => Bound::Udp(Arc::new(UdpSocket::bind(addr).await?)),
+        };
+        bound.push((name, service, listener));
+    }
+    crypto::confirm_session(&mut aead, &mut stream).await?;
+    tracing::info!(
+        services = bound.len(),
+        "client authenticated and services registered"
+    );
+
+    let (create_tx, mut create_rx) = mpsc::channel::<u16>(4096);
+    let hub = Arc::new(PairingHub::new(create_tx));
+    *ACTIVE_HUB.lock().unwrap() = Some(hub.clone());
+    let _hub_guard = HubGuard;
+
+    let (reader, writer) = tokio::io::split(stream);
+    let (tx, rx) = aead.split();
+    let (events, rx_events) = mpsc::channel(8192);
+    let slots = Arc::new(Semaphore::new(cfg.transport.quic.max_streams as usize));
+    let mut tasks = JoinSet::new();
+    for (id, (name, service, listener)) in bound.into_iter().enumerate() {
+        let events = events.clone();
+        let cfg = cfg.clone();
+        let hub = hub.clone();
+        tasks.spawn(async move {
+            tracing::info!(service = %name, "service ready");
+            match listener {
+                Bound::Tcp(listener) => {
+                    tcp_listen(listener, service, id as u16, cfg, hub, events).await
+                }
+                Bound::Udp(socket) => udp_listen(socket, id as u16, events).await,
+            }
+        });
+    }
+    drop(events);
+    drive_server(
+        cfg,
+        reader,
+        writer,
+        tx,
+        rx,
+        rx_events,
+        &mut create_rx,
+        slots,
+        tasks,
+    )
+    .await
 }
 
 pub async fn run_client(cfg: Arc<Side>) -> Result<()> {
@@ -237,72 +416,6 @@ async fn connect(cfg: Arc<Side>) -> Result<()> {
     }
 }
 
-async fn server_session<S>(cfg: Arc<Side>, mut stream: S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (bound, aead) = tokio::time::timeout(SETUP, async {
-        let (mut aead, payload) =
-            crypto::receive_tcp_session(&mut stream, &cfg.transport.noise).await?;
-        let reg: Registration = serde_json::from_slice(&payload)?;
-        ensure!(
-            reg.version == REGISTRATION_VERSION
-                && !reg.services.is_empty()
-                && reg.services.len() <= 256,
-            "invalid registration"
-        );
-        let mut names = HashSet::new();
-        let mut definitions = Vec::new();
-        for offer in reg.services {
-            ensure!(names.insert(offer.name.clone()), "duplicate service");
-            let service = cfg
-                .services
-                .get(&offer.name)
-                .context("service authentication failed")?;
-            ensure!(
-                offer.kind == service.kind
-                    && bool::from(cfg.token(service).as_bytes().ct_eq(offer.token.as_bytes())),
-                "service authentication failed"
-            );
-            definitions.push((offer.name, service.clone()));
-        }
-        let mut bound = Vec::new();
-        for (name, service) in definitions {
-            let addr = service.bind_addr.as_ref().unwrap();
-            let listener = match service.kind {
-                Kind::Tcp => Bound::Tcp(TcpListener::bind(addr).await?),
-                Kind::Udp => Bound::Udp(Arc::new(UdpSocket::bind(addr).await?)),
-            };
-            bound.push((name, service, listener));
-        }
-        crypto::confirm_session(&mut aead, &mut stream).await?;
-        Ok::<_, anyhow::Error>((bound, aead))
-    })
-    .await??;
-    tracing::info!(
-        services = bound.len(),
-        "client authenticated and services registered"
-    );
-    let (reader, writer) = tokio::io::split(stream);
-    let (tx, rx) = aead.split();
-    let (events, rx_events) = mpsc::channel(8192);
-    let slots = Arc::new(Semaphore::new(cfg.transport.quic.max_streams as usize));
-    let mut tasks = JoinSet::new();
-    for (id, (name, service, listener)) in bound.into_iter().enumerate() {
-        let events = events.clone();
-        let cfg = cfg.clone();
-        tasks.spawn(async move {
-            tracing::info!(service = %name, "service ready");
-            match listener {
-                Bound::Tcp(listener) => tcp_listen(listener, service, id as u16, cfg, events).await,
-                Bound::Udp(socket) => udp_listen(socket, id as u16, events).await,
-            }
-        });
-    }
-    drop(events);
-    drive(cfg, reader, writer, tx, rx, rx_events, slots, tasks, true).await
-}
-
 async fn client_session<S>(cfg: Arc<Side>, mut stream: S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -310,15 +423,21 @@ where
     let aead = tokio::time::timeout(SETUP, async {
         let reg = Registration {
             version: REGISTRATION_VERSION,
-            services: cfg
-                .services
-                .iter()
-                .map(|(name, s)| Offer {
-                    name: name.clone(),
-                    kind: s.kind,
-                    token: cfg.token(s).into(),
-                })
-                .collect(),
+            services: {
+                let mut names: Vec<_> = cfg.services.keys().cloned().collect();
+                names.sort();
+                names
+                    .into_iter()
+                    .map(|name| {
+                        let s = &cfg.services[&name];
+                        Offer {
+                            name,
+                            kind: s.kind,
+                            token: cfg.token(s).into(),
+                        }
+                    })
+                    .collect()
+            },
         };
         crypto::initiate_tcp_session(
             &mut stream,
@@ -329,22 +448,92 @@ where
     })
     .await??;
     tracing::info!(services = cfg.services.len(), "tunnel ready");
+
+    let mut service_order: Vec<String> = cfg.services.keys().cloned().collect();
+    service_order.sort();
+    for (id, name) in service_order.iter().enumerate() {
+        let service = &cfg.services[name];
+        if service.kind == Kind::Tcp {
+            for _ in 0..WARM_POOL {
+                let cfg = cfg.clone();
+                let sid = id as u16;
+                tokio::spawn(async move {
+                    if let Err(e) = open_data_channel(cfg, sid).await {
+                        tracing::debug!(error = %e, "warm data channel ended");
+                    }
+                });
+            }
+        }
+    }
+
     let (reader, writer) = tokio::io::split(stream);
     let (tx, rx) = aead.split();
-    let (_unused, rx_events) = mpsc::channel(1);
-    let slots = Arc::new(Semaphore::new(cfg.transport.quic.max_streams as usize));
-    drive(
-        cfg,
-        reader,
-        writer,
-        tx,
-        rx,
-        rx_events,
-        slots,
-        JoinSet::new(),
-        false,
+    drive_client(cfg, reader, writer, tx, rx).await
+}
+
+async fn open_data_channel(cfg: Arc<Side>, service_id: u16) -> Result<()> {
+    let mut names: Vec<_> = cfg.services.keys().cloned().collect();
+    names.sort();
+    let name = names
+        .get(service_id as usize)
+        .context("unknown service")?;
+    let service = &cfg.services[name];
+    ensure!(
+        service.kind == Kind::Tcp,
+        "data channel for non-TCP service"
+    );
+    let remote = resolve(cfg.remote_addr.as_ref().unwrap(), cfg.prefer_ipv6).await?;
+    let mut tcp = tokio::time::timeout(SETUP, TcpStream::connect(remote)).await??;
+    configure_tunnel_socket(&tcp, &cfg.transport.tcp)?;
+
+    let aead = if cfg.transport.kind == "tls" {
+        let root = cfg
+            .tls_trusted_root()
+            .context("type=tls requires trusted_root")?;
+        let tls = TlsConnector::from(Arc::new(transport::rustls_client(root)?));
+        let name = ServerName::try_from(cfg.tls_hostname().to_owned())
+            .map_err(|_| anyhow::anyhow!("invalid TLS hostname"))?;
+        let mut tls = tls.connect(name, tcp).await?;
+        let aead = crypto::initiate_tcp_session(
+            &mut tls,
+            &cfg.transport.noise,
+            &data_open_payload(service_id),
+        )
+        .await?;
+        let local = connect_local(&cfg, service).await?;
+        return crypto::relay_noise(local, tls, aead).await;
+    } else {
+        crypto::initiate_tcp_session(
+            &mut tcp,
+            &cfg.transport.noise,
+            &data_open_payload(service_id),
+        )
+        .await?
+    };
+    let local = connect_local(&cfg, service).await?;
+    crypto::relay_noise(local, tcp, aead).await
+}
+
+async fn connect_local(cfg: &Side, service: &Service) -> Result<TcpStream> {
+    let target = resolve_local(
+        service.local_addr.as_ref().unwrap(),
+        service.prefer_ipv6 || cfg.prefer_ipv6,
     )
-    .await
+    .await?;
+    let retry = cfg.service_retry(service);
+    let nodelay = cfg.nodelay(service);
+    let tcp = loop {
+        match TcpStream::connect(target).await {
+            Ok(tcp) => break tcp,
+            Err(e) if retry > 0 => {
+                tracing::debug!(error = %e, "local TCP connect failed; retrying");
+                tokio::time::sleep(Duration::from_secs(retry)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    tcp.set_nodelay(nodelay)?;
+    Ok(tcp)
 }
 
 async fn tcp_listen(
@@ -352,21 +541,13 @@ async fn tcp_listen(
     service: Service,
     id: u16,
     cfg: Arc<Side>,
-    events: mpsc::Sender<Incoming>,
+    hub: Arc<PairingHub>,
+    _events: mpsc::Sender<Incoming>,
 ) -> Result<()> {
     loop {
         let (tcp, _) = listener.accept().await?;
         tcp.set_nodelay(cfg.nodelay(&service))?;
-        if events
-            .send(Incoming::Tcp {
-                service: id,
-                stream: tcp,
-            })
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
+        hub.visitor_arrived(id, tcp);
     }
 }
 
@@ -405,48 +586,29 @@ async fn udp_listen(socket: Arc<UdpSocket>, id: u16, events: mpsc::Sender<Incomi
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn drive<S>(
+async fn drive_server<S>(
     cfg: Arc<Side>,
-    reader: ReadHalf<S>,
-    writer: WriteHalf<S>,
+    reader: tokio::io::ReadHalf<S>,
+    writer: tokio::io::WriteHalf<S>,
     send: crypto::AeadSend,
     recv: crypto::AeadRecv,
     mut incoming: mpsc::Receiver<Incoming>,
-    slots: Arc<Semaphore>,
+    create_rx: &mut mpsc::Receiver<u16>,
+    _slots: Arc<Semaphore>,
     mut listeners: JoinSet<Result<()>>,
-    server: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut destinations = HashMap::new();
-    if !server {
-        for (id, s) in cfg.services.values().enumerate() {
-            if s.kind == Kind::Udp {
-                destinations.insert(
-                    id as u16,
-                    resolve_local(
-                        s.local_addr.as_ref().unwrap(),
-                        s.prefer_ipv6 || cfg.prefer_ipv6,
-                    )
-                    .await?,
-                );
-            }
-        }
-    }
     let flows = Arc::new(Mutex::new(Flows {
         next: 0,
         by_id: HashMap::new(),
         by_peer: HashMap::new(),
     }));
-    let mut streams: HashMap<u32, mpsc::Sender<StreamMsg>> = HashMap::new();
-    let mut forwards: JoinSet<u32> = JoinSet::new();
     let mut workers = JoinSet::new();
     let mut udp_tx: HashMap<(u16, u64), mpsc::Sender<(Bytes, OwnedSemaphorePermit)>> =
         HashMap::new();
     let queue_bytes = Arc::new(Semaphore::new(8 * 1024 * 1024));
-    let next_stream = AtomicU32::new(1);
-    let mut last = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let (out, out_rx) = mpsc::channel::<Bytes>(1024);
     let (in_tx, mut inbound) = mpsc::channel::<Bytes>(256);
@@ -460,49 +622,20 @@ where
                 anyhow::bail!("tunnel closed");
             },
             Some(result) = listeners.join_next() => { result??; anyhow::bail!("service listener stopped"); },
-            Some(done) = forwards.join_next() => {
-                if let Ok(id) = done {
-                    streams.remove(&id);
-                }
-            },
             Some(done) = workers.join_next() => { let key = done?; udp_tx.remove(&key); },
+            Some(service) = create_rx.recv() => {
+                let mut frame = [CREATE_DATA, 0, 0];
+                frame[1..].copy_from_slice(&service.to_be_bytes());
+                let _ = out.try_send(Bytes::copy_from_slice(&frame));
+            },
             _ = tick.tick() => {
-                if cfg.heartbeat_timeout > 0
-                    && last.elapsed() > Duration::from_secs(cfg.heartbeat_timeout)
-                {
-                    anyhow::bail!("tunnel heartbeat timeout");
-                }
                 if cfg.heartbeat_interval > 0 {
                     let _ = out.try_send(Bytes::from_static(&[HEARTBEAT]));
                 }
                 flows.lock().unwrap().expire(Duration::from_secs(cfg.transport.quic.udp_idle_timeout));
             },
-            event = incoming.recv(), if server => match event {
+            event = incoming.recv() => match event {
                 None => anyhow::bail!("service listener closed"),
-                Some(Incoming::Tcp { service, stream }) => {
-                    let id = next_stream.fetch_add(1, Ordering::Relaxed);
-                    let (tx, rx) = mpsc::channel(256);
-                    streams.insert(id, tx);
-                    let slots = slots.clone();
-                    let out = out.clone();
-                    forwards.spawn(async move {
-                        let Ok(permit) = slots.acquire_owned().await else { return id; };
-                        let _permit = permit;
-                        let mut open = crate::buf::take_vec(7);
-                        open.push(OPEN);
-                        open.extend_from_slice(&id.to_be_bytes());
-                        open.extend_from_slice(&service.to_be_bytes());
-                        let sent = send_frame(&out, &open).await;
-                        crate::buf::give_vec(open);
-                        if sent.is_err() {
-                            return id;
-                        }
-                        if let Err(e) = pipe_tcp(stream, id, out, rx).await {
-                            tracing::debug!(error = %e, "TCP forwarding ended");
-                        }
-                        id
-                    });
-                }
                 Some(Incoming::Udp { service, peer, payload, socket }) => {
                     let flow = {
                         let mut f = flows.lock().unwrap();
@@ -530,15 +663,94 @@ where
                 }
             },
             Some(plain) = inbound.recv() => {
-                last = Instant::now();
-                dispatch(
+                dispatch_control(
                     &plain,
                     &cfg,
-                    server,
+                    true,
                     &out,
-                    &mut streams,
-                    &mut forwards,
-                    &slots,
+                    &HashMap::new(),
+                    &flows,
+                    &mut udp_tx,
+                    &mut workers,
+                    &queue_bytes,
+                ).await?;
+            }
+        }
+    }
+}
+
+async fn drive_client<S>(
+    cfg: Arc<Side>,
+    reader: tokio::io::ReadHalf<S>,
+    writer: tokio::io::WriteHalf<S>,
+    send: crypto::AeadSend,
+    recv: crypto::AeadRecv,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut destinations = HashMap::new();
+    for (id, s) in cfg.services.values().enumerate() {
+        if s.kind == Kind::Udp {
+            destinations.insert(
+                id as u16,
+                resolve_local(
+                    s.local_addr.as_ref().unwrap(),
+                    s.prefer_ipv6 || cfg.prefer_ipv6,
+                )
+                .await?,
+            );
+        }
+    }
+    let flows = Arc::new(Mutex::new(Flows {
+        next: 0,
+        by_id: HashMap::new(),
+        by_peer: HashMap::new(),
+    }));
+    let mut workers = JoinSet::new();
+    let mut udp_tx: HashMap<(u16, u64), mpsc::Sender<(Bytes, OwnedSemaphorePermit)>> =
+        HashMap::new();
+    let queue_bytes = Arc::new(Semaphore::new(8 * 1024 * 1024));
+    let mut last = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let (out, out_rx) = mpsc::channel::<Bytes>(1024);
+    let (in_tx, mut inbound) = mpsc::channel::<Bytes>(256);
+    let mut io = JoinSet::new();
+    io.spawn(async move { mux_write(writer, send, out_rx).await });
+    io.spawn(async move { mux_read(reader, recv, in_tx).await });
+    loop {
+        tokio::select! {
+            Some(result) = io.join_next() => {
+                result??;
+                anyhow::bail!("tunnel closed");
+            },
+            Some(done) = workers.join_next() => { let key = done?; udp_tx.remove(&key); },
+            _ = tick.tick() => {
+                if cfg.heartbeat_timeout > 0
+                    && last.elapsed() > Duration::from_secs(cfg.heartbeat_timeout)
+                {
+                    anyhow::bail!("tunnel heartbeat timeout");
+                }
+                flows.lock().unwrap().expire(Duration::from_secs(cfg.transport.quic.udp_idle_timeout));
+            },
+            Some(plain) = inbound.recv() => {
+                last = Instant::now();
+                if !plain.is_empty() && plain[0] == CREATE_DATA {
+                    ensure!(plain.len() == 3, "invalid CREATE_DATA");
+                    let service = u16::from_be_bytes(plain[1..3].try_into()?);
+                    let cfg = cfg.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = open_data_channel(cfg, service).await {
+                            tracing::debug!(error = %e, "data channel ended");
+                        }
+                    });
+                    continue;
+                }
+                dispatch_control(
+                    &plain,
+                    &cfg,
+                    false,
+                    &out,
                     &destinations,
                     &flows,
                     &mut udp_tx,
@@ -567,14 +779,11 @@ async fn send_udp(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn dispatch(
+async fn dispatch_control(
     plain: &[u8],
     cfg: &Arc<Side>,
     server: bool,
     out: &mpsc::Sender<Bytes>,
-    streams: &mut HashMap<u32, mpsc::Sender<StreamMsg>>,
-    forwards: &mut JoinSet<u32>,
-    slots: &Arc<Semaphore>,
     destinations: &HashMap<u16, SocketAddr>,
     flows: &Arc<Mutex<Flows>>,
     udp_tx: &mut HashMap<(u16, u64), mpsc::Sender<(Bytes, OwnedSemaphorePermit)>>,
@@ -583,40 +792,7 @@ async fn dispatch(
 ) -> Result<()> {
     ensure!(!plain.is_empty(), "empty mux frame");
     match plain[0] {
-        HEARTBEAT => Ok(()),
-        OPEN => {
-            ensure!(!server && plain.len() == 7, "invalid OPEN");
-            let id = u32::from_be_bytes(plain[1..5].try_into()?);
-            let service_id = u16::from_be_bytes(plain[5..7].try_into()?);
-            let (tx, rx) = mpsc::channel(256);
-            streams.insert(id, tx);
-            let cfg = cfg.clone();
-            let out = out.clone();
-            let slots = slots.clone();
-            forwards.spawn(async move {
-                if let Err(e) = accept_open(cfg, service_id, id, slots, out, rx).await {
-                    tracing::debug!(error = %e, "TCP forwarding ended");
-                }
-                id
-            });
-            Ok(())
-        }
-        DATA => {
-            ensure!(plain.len() >= 5, "short DATA");
-            let id = u32::from_be_bytes(plain[1..5].try_into()?);
-            if let Some(tx) = streams.get(&id) {
-                enqueue(tx, StreamMsg::Data(crate::buf::copy_bytes(&plain[5..])));
-            }
-            Ok(())
-        }
-        FIN => {
-            ensure!(plain.len() == 5, "invalid FIN");
-            let id = u32::from_be_bytes(plain[1..5].try_into()?);
-            if let Some(tx) = streams.remove(&id) {
-                enqueue(&tx, StreamMsg::Fin);
-            }
-            Ok(())
-        }
+        HEARTBEAT | CREATE_DATA => Ok(()),
         UDP => {
             ensure!(plain.len() >= 11, "short UDP");
             let service = u16::from_be_bytes(plain[1..3].try_into()?);
@@ -668,103 +844,6 @@ async fn dispatch(
         }
         _ => anyhow::bail!("unknown mux frame"),
     }
-}
-
-fn enqueue(tx: &mpsc::Sender<StreamMsg>, msg: StreamMsg) {
-    if let Err(error) = tx.try_send(msg) {
-        match error {
-            mpsc::error::TrySendError::Full(msg) => {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(msg).await;
-                });
-            }
-            mpsc::error::TrySendError::Closed(_) => {}
-        }
-    }
-}
-
-async fn accept_open(
-    cfg: Arc<Side>,
-    service_id: u16,
-    id: u32,
-    slots: Arc<Semaphore>,
-    out: mpsc::Sender<Bytes>,
-    rx: mpsc::Receiver<StreamMsg>,
-) -> Result<()> {
-    let service = cfg
-        .services
-        .values()
-        .nth(service_id as usize)
-        .ok_or_else(|| anyhow::anyhow!("unknown service"))?;
-    ensure!(service.kind == Kind::Tcp, "wrong service type");
-    let Ok(permit) = slots.acquire_owned().await else {
-        return Ok(());
-    };
-    let target = resolve_local(
-        service.local_addr.as_ref().unwrap(),
-        service.prefer_ipv6 || cfg.prefer_ipv6,
-    )
-    .await?;
-    let retry = cfg.service_retry(service);
-    let nodelay = cfg.nodelay(service);
-    let tcp = loop {
-        match TcpStream::connect(target).await {
-            Ok(tcp) => break tcp,
-            Err(e) if retry > 0 => {
-                tracing::debug!(error = %e, "local TCP connect failed; retrying");
-                tokio::time::sleep(Duration::from_secs(retry)).await;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    };
-    tcp.set_nodelay(nodelay)?;
-    let _permit = permit;
-    pipe_tcp(tcp, id, out, rx).await
-}
-
-async fn pipe_tcp(
-    tcp: TcpStream,
-    id: u32,
-    out: mpsc::Sender<Bytes>,
-    mut rx: mpsc::Receiver<StreamMsg>,
-) -> Result<()> {
-    let (mut reader, mut writer) = tcp.into_split();
-    let up = async {
-        let mut buf = crate::buf::take_vec(CHUNK);
-        buf.resize(CHUNK, 0);
-        let mut frame = crate::buf::take_vec(5 + CHUNK);
-        loop {
-            let n = reader.read(&mut buf).await?;
-            if n == 0 {
-                frame.clear();
-                frame.push(FIN);
-                frame.extend_from_slice(&id.to_be_bytes());
-                send_frame(&out, &frame).await?;
-                crate::buf::give_vec(buf);
-                crate::buf::give_vec(frame);
-                return Ok::<_, anyhow::Error>(());
-            }
-            frame.clear();
-            frame.push(DATA);
-            frame.extend_from_slice(&id.to_be_bytes());
-            frame.extend_from_slice(&buf[..n]);
-            send_frame(&out, &frame).await?;
-        }
-    };
-    let down = async {
-        loop {
-            match rx.recv().await {
-                Some(StreamMsg::Data(data)) => writer.write_all(&data).await?,
-                Some(StreamMsg::Fin) | None => {
-                    writer.shutdown().await?;
-                    return Ok::<_, anyhow::Error>(());
-                }
-            }
-        }
-    };
-    tokio::try_join!(up, down)?;
-    Ok(())
 }
 
 async fn udp_flow(
