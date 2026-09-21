@@ -9,6 +9,8 @@ services:
   backend:
     build:
       context: ./backend
+    environment:
+      VIDEO_BYTES: ${VIDEO_BYTES:-10737418240}
     networks:
       - public
       - private
@@ -134,6 +136,9 @@ services:
       SAMPLES: ${SAMPLES:-1}
       SATURATION_STEPS: ${SATURATION_STEPS:-64 256 1000}
       WRK_TIMEOUT: ${WRK_TIMEOUT:-30s}
+      TESTS: ${TESTS:-correctness,latency,saturation,stress,stream}
+      VIDEO_BYTES: ${VIDEO_BYTES:-10737418240}
+      STREAM_TIMEOUT: ${STREAM_TIMEOUT:-900}
       CATHOLE_REVISION: ${CATHOLE_REVISION:-working-tree}
       DOCKER_VERSION: ${DOCKER_VERSION:-unknown}
       TARGET: ${TARGET:-}

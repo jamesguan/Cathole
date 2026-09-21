@@ -422,7 +422,7 @@ network results. Each run writes ranked `BENCHMARK-RESULTS.md` /
 <!-- docker-benchmark-results:start -->
 # Docker comparison benchmark results
 
-Run at: 2026-09-21T04:06:24Z
+Run at: 2026-09-21T04:25:29Z
 
 Stacks were started and measured **one target at a time**. Other reverse-proxy and VPN containers were stopped during each run so CPU, sockets, and the Docker bridge were not shared.
 
@@ -498,7 +498,27 @@ Score weights: saturation throughput 35%, small-response request rate 20%, p50 l
 | stress | rathole | 1000 | 200713 | 27.37 | 4.64 | 7.97 | 52.25 | 0 |
 | stress | wireguard | 1000 | 44256 | 6.03 | 22.18 | 26.05 | 27.51 | 0 |
 
-Correctness performs 30 requests per target and verifies the hello response plus exact 64 KiB and 1 MiB bodies.
+## Emby-style 10 GiB stream
+
+One HTTP/1.1 GET of a generated 10 GiB `video/mp4` body on a single connection, discarded to `/dev/null`. This matches progressive playback more closely than wrk. 4K HEVC is about 25 Mbps (3.1 MiB/s); anything above that has headroom.
+
+| Rank | Target | MiB/s | Seconds | TTFB s | Complete |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 1 | direct | 4762.79 | 2.15 | 0 | PASS |
+| 2 | rathole | 284.99 | 35.93 | 0 | PASS |
+| 3 | cathole | 218.7 | 46.82 | 0 | PASS |
+| 4 | frp | 184.93 | 55.37 | 0 | PASS |
+| 5 | wireguard | 54.17 | 189.01 | 0 | PASS |
+
+| Target | Seek (16 x 8 MiB Range) | Seek MiB/s |
+| --- | --- | ---: |
+| direct | PASS | 711.11 |
+| rathole | PASS | 152.38 |
+| wireguard | PASS | 50.59 |
+| cathole | PASS | 182.85 |
+| frp | PASS | 158.02 |
+
+Correctness performs 30 requests per target and verifies the hello response plus exact 64 KiB and 1 MiB bodies. Stream tests also check `/video` Content-Length and one Range response.
 
 | Target | Correctness |
 | --- | --- |

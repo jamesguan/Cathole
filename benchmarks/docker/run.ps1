@@ -21,7 +21,9 @@ if (-not $env:THREADS) { $env:THREADS = '16' }
 if (-not $env:DURATION) { $env:DURATION = '10' }
 if (-not $env:STRESS_DURATION) { $env:STRESS_DURATION = '10' }
 if (-not $env:SAMPLES) { $env:SAMPLES = '1' }
-if (-not $env:SATURATION_STEPS) { $env:SATURATION_STEPS = '64 256 1000' }
+if (-not $env:TESTS) { $env:TESTS = 'correctness,latency,saturation,stress,stream' }
+if (-not $env:VIDEO_BYTES) { $env:VIDEO_BYTES = '10737418240' }
+if (-not $env:STREAM_TIMEOUT) { $env:STREAM_TIMEOUT = '900' }
 
 $proxyServices = @(
     'rathole-server', 'rathole-client',
@@ -54,8 +56,20 @@ try {
     Invoke-Docker -ComposeArgs @('compose', '--profile', 'benchmark', 'build')
     Invoke-Docker -ComposeArgs @('compose', '--profile', 'benchmark', 'down', '--volumes', '--remove-orphans')
     New-Item -ItemType Directory -Force -Path .\results | Out-Null
-    $utf8 = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'results\raw.jsonl'), '', $utf8)
+    python -c @"
+import json, pathlib
+src = pathlib.Path(r'results/latest.json')
+out = pathlib.Path(r'results/raw.jsonl')
+keep = {'latency', 'saturation', 'stress'}
+lines = []
+if src.exists():
+    data = json.loads(src.read_text(encoding='utf-8'))
+    for row in data.get('results', []):
+        if row.get('test') in keep:
+            lines.append(json.dumps(row, separators=(',', ':')))
+out.write_text(('\n'.join(lines) + ('\n' if lines else '')), encoding='utf-8')
+print('preserved', len(lines), 'prior wrk samples')
+"@
 
     Invoke-Docker -ComposeArgs @('compose', 'up', '-d', 'backend')
 
@@ -68,6 +82,7 @@ try {
         Invoke-Docker -ComposeArgs @(
             'compose', '--profile', 'benchmark', 'run', '--rm', '--no-deps',
             '-e', "TARGET=$($target.Name)", '-e', 'GENERATE_REPORT=0',
+            "--env=TESTS=$($env:TESTS)", "--env=VIDEO_BYTES=$($env:VIDEO_BYTES)",
             '--name', "bench-$($target.Name)", 'benchmark'
         )
         if ($target.Services.Count -gt 0) {
@@ -79,6 +94,7 @@ try {
     Invoke-Docker -ComposeArgs @(
         'compose', '--profile', 'benchmark', 'run', '--rm', '--no-deps',
         '-e', 'TARGET=', '-e', 'GENERATE_REPORT=1',
+        "--env=TESTS=$($env:TESTS)", "--env=VIDEO_BYTES=$($env:VIDEO_BYTES)",
         '--name', 'bench-report', 'benchmark'
     )
 

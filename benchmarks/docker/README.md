@@ -49,15 +49,18 @@ Optional tuning variables:
 
 ```sh
 THREADS=16 DURATION=20 STRESS_DURATION=30 SAMPLES=3 \
-SATURATION_STEPS="64 256 1000 2000" ./benchmarks/docker/run.sh
+SATURATION_STEPS="64 256 1000 2000" \
+TESTS="correctness,latency,saturation,stress,stream,seek" \
+VIDEO_BYTES=10737418240 ./benchmarks/docker/run.sh
 ```
 
-The default one-sample run takes about six minutes after images are built. Each
-target is started **alone**: other reverse-proxy and VPN containers are stopped
-so they cannot steal CPU, sockets, or bridge bandwidth. It writes
-`results/latest.json` and `results/latest.md`, copies ranked results to
-`BENCHMARK-RESULTS.md` and `BENCHMARK-RESULTS.json` at the repository root, and
-replaces the generated-results block in the project README.
+The default one-sample run takes about six minutes after images are built, plus
+about one to four minutes per target for the 10 GiB stream. Each target is
+started **alone**: other reverse-proxy and VPN containers are stopped so they
+cannot steal CPU, sockets, or bridge bandwidth. It writes `results/latest.json`
+and `results/latest.md`, copies ranked results to `BENCHMARK-RESULTS.md` and
+`BENCHMARK-RESULTS.json` at the repository root, and replaces the
+generated-results block in the project README.
 
 ## The four tests
 
@@ -68,8 +71,10 @@ replaces the generated-results block in the project README.
 3. **Saturation:** the same `wrk` process sweeps 64, 256, and 1,000 connections
    against a 64 KiB response. Transfer MiB/s is the primary network-saturation
    metric. Increase `SATURATION_STEPS` until throughput stops increasing.
-4. **Stress:** the requested shape, `wrk -c 1000 -t 16 -d 10s`, against the hello
-   endpoint. Errors and p50/p95/p99 latency are recorded with request rate.
+4. **Stress:** `wrk -c 1000 -t 16 -d 10s` against the hello endpoint.
+5. **Emby-style stream:** one HTTP/1.1 GET of a generated 10 GiB `video/mp4`
+   body on a single connection (`curl` to `/dev/null`). Optional `seek` runs 16
+   scattered 8 MiB `Range` requests. Tune with `VIDEO_BYTES` and `TESTS`.
 
 Every timed path uses `wrk --latency` and records the full latency distribution
 plus connect/read/write/status/timeout errors. Each target is warmed for two
