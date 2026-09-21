@@ -20,14 +20,19 @@ pub async fn run(cfg: Arc<Side>) -> Result<()> {
             delay = 1;
         }
         // Cap exponential backoff and add jitter; no retry storm or unbounded delay.
-        let wait = Duration::from_millis(delay * 1000 + rand::random_range(0..=1000));
+        let base = cfg.retry_interval;
+        let wait = if base == 0 {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(delay.max(base) * 1000 + rand::random_range(0..=1000))
+        };
         tokio::time::sleep(wait).await;
-        delay = (delay * 2).min(30);
+        delay = (delay.max(base) * 2).min(30.max(base));
     }
 }
 
 async fn connect(cfg: Arc<Side>) -> Result<()> {
-    let remote = resolve(cfg.remote_addr.as_ref().unwrap()).await?;
+    let remote = resolve(cfg.remote_addr.as_ref().unwrap(), cfg.prefer_ipv6).await?;
     let bind = if remote.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -62,7 +67,7 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
                 .collect(),
         };
         let (mut send, mut recv) = conn.open_bi().await?;
-        let (hs, reply) = crypto::initiate(
+        let (data_crypto, reply) = crypto::initiate_datagram(
             &conn,
             &cfg.transport.noise,
             &mut send,
@@ -79,9 +84,7 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
         );
         Ok::<_, anyhow::Error>(Arc::new(Session {
             conn: conn.clone(),
-            data: Arc::new(datagram::Sender::new(crypto::DatagramCrypto::new(
-                hs.into_stateless_transport_mode()?,
-            ))),
+            data: Arc::new(datagram::Sender::new(data_crypto)),
         }))
     })
     .await??;
@@ -89,7 +92,14 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
     let mut destinations = HashMap::new();
     for (id, s) in cfg.services.values().enumerate() {
         if s.kind == Kind::Udp {
-            destinations.insert(id as u16, resolve(s.local_addr.as_ref().unwrap()).await?);
+            destinations.insert(
+                id as u16,
+                resolve_local(
+                    s.local_addr.as_ref().unwrap(),
+                    s.prefer_ipv6 || cfg.prefer_ipv6,
+                )
+                .await?,
+            );
         }
     }
     let slots = Arc::new(Semaphore::new(cfg.transport.quic.max_streams as usize));

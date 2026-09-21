@@ -4,9 +4,11 @@ This is a local implementation review, not an independent audit.
 
 Implemented and covered by code/tests:
 
-- TLS certificate validation against a dedicated trust root and hostname.
-- Pinned Noise NK server identity; no unauthenticated Noise pattern or insecure
-  TLS verifier. Per-service tokens are mandatory.
+- TLS certificate validation against a dedicated trust root and hostname when a
+  root is configured. NK/KK compatibility mode can instead defer peer identity
+  to the pinned Noise keys while retaining TLS encryption and signature checks.
+- Pinned Noise NK server identity, mutual pinned keys with KK, or XX with a
+  mandatory pinned QUIC certificate. Per-service tokens are mandatory.
 - Noise prologue binds the session and TCP stream context to the TLS exporter.
 - AEAD integrity and a post-authentication UDP replay window; directional nonce
   separation, fresh session keys, fail-closed nonce budget.
@@ -36,7 +38,9 @@ services can reflect/amplify traffic according to the exposed application's
 behavior. The transport does not make an unsafe public DNS/game/admin service
 safe. Set deployment limits and bind only the services you intend to expose.
 
-Only server identity is a static Noise key in NK. Client authorization uses
-encrypted bearer tokens, not mutual static-key authentication. The QUIC TLS
-certificate identity is independently verified; there is no implicit trust on
-first use and no UI certificate-warning bypass.
+With NK, only the server identity is a static Noise key and client authorization
+uses encrypted bearer tokens. Use KK when both endpoints require pinned static
+Noise identities. In certificate-free NK/KK mode, the ephemeral QUIC certificate
+is not an identity credential; the inner Noise handshake must succeed before any
+token or application payload is accepted. XX therefore requires a pinned QUIC
+certificate and is rejected without one.

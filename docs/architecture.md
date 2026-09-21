@@ -74,13 +74,15 @@ No raw IP packet forwarding or source-IP transparency is implied.
 ## Security choice
 
 Standard QUIC mandates TLS 1.3; swapping it for Noise is not standard QUIC.
-We use a pinned trust root plus hostname validation for QUIC, and the user's
-requested Noise NK inside it. This duplicates encryption and introduces our own
+Cathole runs NK, KK, or XX Noise inside QUIC. A configured trust root adds normal
+hostname/certificate authentication. For legacy NK/KK files without certificates,
+QUIC uses an ephemeral certificate and the pinned Noise key supplies peer identity;
+XX is rejected in that mode. This duplicates encryption and introduces our own
 application framing, but does not invent a cipher, handshake pattern, or loss
 recovery protocol. The Noise prologue binds to a QUIC TLS exporter and the stream
-context, preventing cross-connection/stream substitution. Service tokens remain
-encrypted, even in the first NK message. This composition needs independent
-review; using mature primitives does not itself audit an application protocol.
+context, preventing cross-connection/stream substitution. Service tokens are
+sent only after the Noise handshake. This composition needs independent review;
+using mature primitives does not itself audit an application protocol.
 
 For a future leaner version, choose either QUIC/TLS alone or a well-established
 Noise-based IP tunnel such as WireGuard plus service enforcement. Neither change

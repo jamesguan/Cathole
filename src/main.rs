@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cathole::{
     config::{Config, PATTERN},
     proxy,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -20,16 +20,21 @@ struct Args {
     /// Validate configuration and identity files, then exit.
     #[arg(long)]
     check: bool,
-    /// Print a fresh Noise X25519 keypair.
-    #[arg(long)]
-    genkey: bool,
+    /// Print a fresh Noise keypair (default: x25519).
+    #[arg(long, num_args = 0..=1, default_missing_value = "x25519", value_name = "CURVE")]
+    genkey: Option<KeypairType>,
     /// Create local example configs and fresh TLS/Noise identities in a new directory.
     #[arg(long)]
     init: Option<PathBuf>,
-    #[arg(long, conflicts_with = "client")]
+    #[arg(long, short = 's', conflicts_with = "client")]
     server: bool,
-    #[arg(long, conflicts_with = "server")]
+    #[arg(long, short = 'c', conflicts_with = "server")]
     client: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KeypairType {
+    X25519,
 }
 
 fn create(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -156,8 +161,11 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    if args.genkey {
-        let k = snow::Builder::new(PATTERN.parse()?).generate_keypair()?;
+    if let Some(curve) = args.genkey {
+        let pattern = match curve {
+            KeypairType::X25519 => PATTERN,
+        };
+        let k = snow::Builder::new(pattern.parse()?).generate_keypair()?;
         println!(
             "Private Key:\n{}\nPublic Key:\n{}",
             STANDARD.encode(k.private),
@@ -171,15 +179,17 @@ async fn main() -> Result<()> {
     let path = args
         .config
         .context("provide a config file, --init DIR, or --genkey")?;
-    let mut current = Config::read(&path)?;
-    ensure!(
-        !args.server || current.server.is_some(),
-        "--server requires [server]"
-    );
-    ensure!(
-        !args.client || current.client.is_some(),
-        "--client requires [client]"
-    );
+    let parsed = Config::read(&path)?;
+    let role_server = if args.server {
+        true
+    } else if args.client {
+        false
+    } else if parsed.server.is_some() != parsed.client.is_some() {
+        parsed.server.is_some()
+    } else {
+        anyhow::bail!("config contains both roles; select --server/-s or --client/-c")
+    };
+    let mut current = parsed.select(role_server)?;
     validate_files(&current)?;
     if args.check {
         println!("Configuration and identity files are valid");
@@ -202,13 +212,12 @@ async fn main() -> Result<()> {
                 let Ok(bytes) = std::fs::read(&path) else { continue; };
                 if bytes == seen { continue; }
                 seen = bytes;
-                match Config::read(&path).and_then(|c| { validate_files(&c)?; Ok(c) }) {
-                    Ok(next) if next.server.is_some() == current.server.is_some() => {
+                match Config::read(&path).and_then(|c| c.select(role_server)).and_then(|c| { validate_files(&c)?; Ok(c) }) {
+                    Ok(next) => {
                         tracing::warn!("config changed; restarting session and active forwarded connections");
                         let _ = stop.send(true); let _ = (&mut running).await;
                         rollback = Some(current); current = next; (stop, running) = launch(current.clone());
                     },
-                    Ok(_) => tracing::error!("reload cannot change client/server role"),
                     Err(e) => tracing::error!(error = %e, "invalid reload ignored; previous configuration remains active"),
                 }
             }

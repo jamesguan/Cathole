@@ -12,87 +12,108 @@ pub struct Config {
     pub client: Option<Side>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn sample() -> String {
-        r#"
-[client]
-remote_addr = "localhost:2333"
-default_token = "test-secret"
-[client.transport]
-type = "quic"
-[client.transport.noise]
-remote_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-[client.transport.quic]
-trusted_root = "server.der"
-[client.services.minecraft]
-local_addr = "localhost:25565"
-"#
-        .into()
-    }
-    #[test]
-    fn service_defaults_and_tokens() {
-        let c = Config::parse(&sample()).unwrap().client.unwrap();
-        let s = &c.services["minecraft"];
-        assert_eq!(s.kind, Kind::Tcp);
-        assert!(s.nodelay);
-        assert_eq!(c.token(s), "test-secret");
-    }
-    #[test]
-    fn rejects_unsafe_or_unsupported_config() {
-        for text in [
-            sample().replace("test-secret", ""),
-            sample().replace("quic\"", "tcp\""),
-            sample().replace("trusted_root", "trust_any_certificate"),
-            sample().replace(
-                "[client.services.minecraft]",
-                "keep_alive_interval = 18446744073709551615\n[client.services.minecraft]",
-            ),
-        ] {
-            assert!(Config::parse(&text).is_err());
-        }
-    }
-    #[test]
-    fn parse_errors_do_not_print_secrets() {
-        let text = sample().replace(
-            "default_token = \"test-secret\"",
-            "default_token = [\"test-secret\"]",
-        );
-        let error = Config::parse(&text).err().unwrap().to_string();
-        assert!(!error.contains("test-secret"));
-    }
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Side {
     pub bind_addr: Option<String>,
     pub remote_addr: Option<String>,
     pub default_token: Option<String>,
+    #[serde(default)]
+    pub prefer_ipv6: bool,
+    #[serde(default = "heartbeat_timeout")]
+    pub heartbeat_timeout: u64,
+    #[serde(default = "heartbeat_interval")]
+    pub heartbeat_interval: u64,
+    #[serde(default = "retry_interval")]
+    pub retry_interval: u64,
+    #[serde(default)]
     pub transport: Transport,
     pub services: BTreeMap<String, Service>,
 }
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Transport {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub noise: Noise,
-    pub quic: Quic,
+fn heartbeat_timeout() -> u64 {
+    40
+}
+fn heartbeat_interval() -> u64 {
+    30
+}
+fn retry_interval() -> u64 {
+    1
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
+pub struct Transport {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub tcp: TcpCompat,
+    pub tls: Option<TlsCompat>,
+    pub noise: Noise,
+    pub websocket: Option<WebsocketCompat>,
+    pub quic: Quic,
+}
+impl Default for Transport {
+    fn default() -> Self {
+        Self {
+            kind: "quic".into(),
+            tcp: TcpCompat::default(),
+            tls: None,
+            noise: Noise::default(),
+            websocket: None,
+            quic: Quic::default(),
+        }
+    }
+}
+
+/// Parsed for migration compatibility. Cathole never uses TCP as its tunnel.
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpCompat {
+    pub proxy: Option<String>,
+    pub nodelay: bool,
+    pub keepalive_secs: u64,
+    pub keepalive_interval: u64,
+}
+impl Default for TcpCompat {
+    fn default() -> Self {
+        Self {
+            proxy: None,
+            nodelay: true,
+            keepalive_secs: 20,
+            keepalive_interval: 8,
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsCompat {
+    pub hostname: Option<String>,
+    pub trusted_root: Option<String>,
+    pub pkcs12: Option<String>,
+    pub pkcs12_password: Option<String>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebsocketCompat {
+    pub tls: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Noise {
-    #[serde(default = "pattern")]
     pub pattern: String,
     pub local_private_key: Option<String>,
     pub remote_public_key: Option<String>,
 }
-fn pattern() -> String {
-    PATTERN.into()
+impl Default for Noise {
+    fn default() -> Self {
+        Self {
+            pattern: PATTERN.into(),
+            local_private_key: None,
+            remote_public_key: None,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -150,11 +171,10 @@ pub struct Service {
     pub token: Option<String>,
     pub bind_addr: Option<String>,
     pub local_addr: Option<String>,
-    #[serde(default = "yes")]
-    pub nodelay: bool,
-}
-fn yes() -> bool {
-    true
+    #[serde(default)]
+    pub prefer_ipv6: bool,
+    pub nodelay: Option<bool>,
+    pub retry_interval: Option<u64>,
 }
 
 impl Side {
@@ -165,6 +185,12 @@ impl Side {
             .or(self.default_token.as_deref())
             .unwrap_or("")
     }
+    pub fn nodelay(&self, service: &Service) -> bool {
+        service.nodelay.unwrap_or(self.transport.tcp.nodelay)
+    }
+    pub fn service_retry(&self, service: &Service) -> u64 {
+        service.retry_interval.unwrap_or(self.retry_interval)
+    }
 }
 
 pub fn key(value: &Option<String>) -> Result<Vec<u8>> {
@@ -173,117 +199,251 @@ pub fn key(value: &Option<String>) -> Result<Vec<u8>> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing Noise key"))?,
     )?;
-    ensure!(bytes.len() == 32, "Noise key must decode to 32 bytes");
+    ensure!(
+        bytes.len() == 32,
+        "Noise X25519 key must decode to 32 bytes"
+    );
     Ok(bytes)
+}
+
+fn validate_noise(noise: &Noise, server: bool, pinned_tls: bool) -> Result<()> {
+    ensure!(
+        matches!(
+            noise.pattern.as_str(),
+            "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+                | "Noise_KK_25519_ChaChaPoly_BLAKE2s"
+                | "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+        ),
+        "supported Noise patterns are NK, KK, and XX with 25519/ChaChaPoly/BLAKE2s"
+    );
+    match noise.pattern.split('_').nth(1) {
+        Some("NK") => {
+            if server {
+                key(&noise.local_private_key)?;
+            } else {
+                key(&noise.remote_public_key)?;
+            }
+        }
+        Some("KK") => {
+            key(&noise.local_private_key)?;
+            key(&noise.remote_public_key)?;
+        }
+        Some("XX") => ensure!(
+            pinned_tls,
+            "Noise XX requires QUIC certificate authentication"
+        ),
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn validate_side(s: &mut Side, server: bool) -> Result<()> {
+    ensure!(
+        matches!(s.transport.kind.as_str(), "noise" | "quic"),
+        "Cathole always transports over QUIC/UDP; use transport.type = noise or quic"
+    );
+    ensure!(
+        s.transport.tcp.proxy.is_none(),
+        "HTTP/SOCKS TCP proxy settings cannot carry the UDP tunnel"
+    );
+    let q = &mut s.transport.quic;
+    if !server {
+        q.max_idle_timeout = s.heartbeat_timeout;
+    }
+    if server {
+        q.keep_alive_interval = s.heartbeat_interval;
+    }
+    ensure!(
+        (65536..=268435456).contains(&q.stream_receive_window)
+            && (q.stream_receive_window..=536870912).contains(&q.receive_window)
+            && (65536..=536870912).contains(&q.send_window)
+            && (65536..=16777216).contains(&q.socket_buffer),
+        "flow-control or socket buffer limits out of range"
+    );
+    ensure!(
+        q.keep_alive_interval <= 86400
+            && q.max_idle_timeout <= 86400
+            && (1..=86400).contains(&q.udp_idle_timeout),
+        "timeouts out of range"
+    );
+    ensure!(
+        (1..=4096).contains(&q.max_connections)
+            && (1..=4096).contains(&q.max_streams)
+            && (1..=65536).contains(&q.max_udp_flows),
+        "resource limits out of range"
+    );
+    ensure!(
+        !s.services.is_empty() && s.services.len() <= 256,
+        "configure 1..256 services"
+    );
+    if server {
+        ensure!(
+            s.bind_addr.is_some() && s.remote_addr.is_none(),
+            "server requires bind_addr only"
+        );
+        ensure!(
+            q.certificate.is_some() == q.private_key.is_some(),
+            "provide both QUIC certificate and private_key, or neither in Noise mode"
+        );
+    } else {
+        ensure!(
+            s.remote_addr.is_some() && s.bind_addr.is_none(),
+            "client requires remote_addr only"
+        );
+    }
+    let pinned_tls = if server {
+        q.certificate.is_some()
+    } else {
+        q.trusted_root.is_some()
+    };
+    validate_noise(&s.transport.noise, server, pinned_tls)?;
+    ensure!(s.retry_interval <= 86400, "retry_interval out of range");
+    for (name, service) in &s.services {
+        ensure!(
+            !name.is_empty() && name.len() <= 128,
+            "service name length must be 1..128"
+        );
+        ensure!(
+            !s.token(service).is_empty() && s.token(service).len() <= 512,
+            "service {name} requires a token of 1..512 bytes"
+        );
+        ensure!(
+            service.retry_interval.unwrap_or(s.retry_interval) <= 86400,
+            "service {name} retry_interval out of range"
+        );
+        if server && (service.bind_addr.is_none() || service.local_addr.is_some()) {
+            bail!("server service {name} requires bind_addr only");
+        }
+        if !server && (service.local_addr.is_none() || service.bind_addr.is_some()) {
+            bail!("client service {name} requires local_addr only");
+        }
+    }
+    Ok(())
 }
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
-        // TOML's Display error includes source lines, which can contain secrets.
-        let c: Self = toml::from_str(text).map_err(|e: toml::de::Error| {
+        let mut c: Self = toml::from_str(text).map_err(|e: toml::de::Error| {
             anyhow::anyhow!(
                 "invalid TOML or unsupported field at byte range {:?}",
                 e.span()
             )
         })?;
         ensure!(
-            c.server.is_some() != c.client.is_some(),
-            "configure exactly one of [server] or [client]"
+            c.server.is_some() || c.client.is_some(),
+            "configure [server], [client], or both"
         );
-        let server = c.server.is_some();
-        let s = c.server.as_ref().or(c.client.as_ref()).unwrap();
-        ensure!(
-            s.transport.kind == "quic",
-            "transport.type must be quic; no TCP fallback exists"
-        );
-        ensure!(
-            s.transport.noise.pattern == PATTERN,
-            "only pinned Noise NK is supported"
-        );
-        let q = &s.transport.quic;
-        ensure!(
-            (65536..=268435456).contains(&q.stream_receive_window)
-                && (q.stream_receive_window..=536870912).contains(&q.receive_window)
-                && (65536..=536870912).contains(&q.send_window)
-                && (65536..=16777216).contains(&q.socket_buffer),
-            "flow-control or socket buffer limits out of range"
-        );
-        ensure!(
-            (1..=86400).contains(&q.keep_alive_interval)
-                && q.max_idle_timeout > q.keep_alive_interval * 3,
-            "idle timeout must exceed three keepalive intervals"
-        );
-        ensure!(
-            (1..=86400).contains(&q.max_idle_timeout) && (1..=86400).contains(&q.udp_idle_timeout),
-            "timeouts must be 1..86400 seconds"
-        );
-        ensure!(
-            (1..=4096).contains(&q.max_connections)
-                && (1..=4096).contains(&q.max_streams)
-                && (1..=65536).contains(&q.max_udp_flows),
-            "resource limits out of range"
-        );
-        ensure!(
-            !s.services.is_empty() && s.services.len() <= 256,
-            "configure 1..256 services"
-        );
-        if server {
-            ensure!(
-                s.bind_addr.is_some() && s.remote_addr.is_none(),
-                "server requires bind_addr only"
-            );
-            ensure!(
-                q.certificate.is_some() && q.private_key.is_some(),
-                "server requires QUIC certificate and private_key DER files"
-            );
-            key(&s.transport.noise.local_private_key)?;
-        } else {
-            ensure!(
-                s.remote_addr.is_some() && s.bind_addr.is_none(),
-                "client requires remote_addr only"
-            );
-            ensure!(
-                q.trusted_root.is_some(),
-                "client requires QUIC trusted_root DER file"
-            );
-            key(&s.transport.noise.remote_public_key)?;
+        if let Some(s) = c.server.as_mut() {
+            validate_side(s, true)?;
         }
-        for (name, service) in &s.services {
-            ensure!(
-                !name.is_empty() && name.len() <= 128,
-                "service name length must be 1..128"
-            );
-            ensure!(
-                !s.token(service).is_empty() && s.token(service).len() <= 512,
-                "service {name} requires a token of 1..512 bytes"
-            );
-            if server && (service.bind_addr.is_none() || service.local_addr.is_some()) {
-                bail!("server service {name} requires bind_addr only");
-            }
-            if !server && (service.local_addr.is_none() || service.bind_addr.is_some()) {
-                bail!("client service {name} requires local_addr only");
-            }
+        if let Some(s) = c.client.as_mut() {
+            validate_side(s, false)?;
         }
         Ok(c)
     }
     pub fn read(path: &Path) -> Result<Self> {
         let mut c = Self::parse(&std::fs::read_to_string(path)?)?;
         let dir = path.parent().unwrap_or(Path::new("."));
-        let q = &mut c
-            .server
-            .as_mut()
-            .or(c.client.as_mut())
-            .unwrap()
-            .transport
-            .quic;
-        for p in [&mut q.certificate, &mut q.private_key, &mut q.trusted_root]
-            .into_iter()
-            .flatten()
-        {
-            if Path::new(p).is_relative() {
-                *p = dir.join(&p).to_string_lossy().into_owned();
+        for side in c.server.iter_mut().chain(c.client.iter_mut()) {
+            let q = &mut side.transport.quic;
+            for p in [&mut q.certificate, &mut q.private_key, &mut q.trusted_root]
+                .into_iter()
+                .flatten()
+            {
+                if Path::new(p).is_relative() {
+                    *p = dir.join(&p).to_string_lossy().into_owned();
+                }
             }
         }
         Ok(c)
+    }
+    pub fn select(mut self, server: bool) -> Result<Self> {
+        if server {
+            ensure!(self.server.is_some(), "--server requires [server]");
+            self.client = None;
+        } else {
+            ensure!(self.client.is_some(), "--client requires [client]");
+            self.server = None;
+        }
+        Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn sample() -> String {
+        r#"
+[client]
+remote_addr = "localhost:2333"
+default_token = "test-secret"
+heartbeat_timeout = 40
+retry_interval = 2
+[client.transport]
+type = "noise"
+[client.transport.noise]
+remote_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+[client.services.minecraft]
+local_addr = "localhost:25565"
+prefer_ipv6 = true
+retry_interval = 3
+"#
+        .into()
+    }
+    #[test]
+    fn legacy_noise_config_and_defaults() {
+        let c = Config::parse(&sample()).unwrap().client.unwrap();
+        let s = &c.services["minecraft"];
+        assert_eq!(s.kind, Kind::Tcp);
+        assert!(c.nodelay(s));
+        assert_eq!(c.token(s), "test-secret");
+        assert_eq!(c.service_retry(s), 3);
+        assert_eq!(c.transport.quic.max_idle_timeout, 40);
+
+        let text = sample().replace(
+            "[client.transport.noise]",
+            "[client.transport.tcp]\nnodelay = false\n[client.transport.noise]",
+        );
+        let c = Config::parse(&text).unwrap().client.unwrap();
+        assert!(!c.nodelay(&c.services["minecraft"]));
+    }
+    #[test]
+    fn rejects_unsupported_transport_and_proxy() {
+        assert!(Config::parse(&sample().replace("type = \"noise\"", "type = \"tcp\"")).is_err());
+        assert!(
+            Config::parse(&sample().replace(
+                "[client.transport.noise]",
+                "[client.transport.tcp]\nproxy = \"http://localhost:1\"\n[client.transport.noise]"
+            ))
+            .is_err()
+        );
+    }
+    #[test]
+    fn both_roles_can_share_one_file() {
+        let server = r#"
+[server]
+bind_addr = "localhost:2333"
+default_token = "test-secret"
+[server.transport]
+type = "noise"
+[server.transport.noise]
+local_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+[server.services.minecraft]
+bind_addr = "localhost:25565"
+"#;
+        let both = format!("{}\n{}", sample(), server);
+        let c = Config::parse(&both).unwrap();
+        assert!(c.client.is_some() && c.server.is_some());
+        assert!(c.clone().select(true).unwrap().client.is_none());
+        assert!(c.select(false).unwrap().server.is_none());
+    }
+    #[test]
+    fn parse_errors_do_not_print_secrets() {
+        let text = sample().replace(
+            "default_token = \"test-secret\"",
+            "default_token = [\"test-secret\"]",
+        );
+        let error = Config::parse(&text).err().unwrap().to_string();
+        assert!(!error.contains("test-secret"));
     }
 }

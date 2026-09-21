@@ -21,6 +21,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("binary", nargs="?", default="target/debug/cathole.exe" if os.name == "nt" else "target/debug/cathole")
 parser.add_argument("--loss", type=float, default=0)
 parser.add_argument("--ipv6", action="store_true")
+parser.add_argument("--legacy-noise", action="store_true", help="remove QUIC identity tables and use type=noise compatibility config")
+parser.add_argument("--pattern", choices=["nk", "kk", "xx"], default="nk")
 args = parser.parse_args()
 binary = str(Path(args.binary).resolve())
 host = "::1" if args.ipv6 else "127.0.0.1"
@@ -198,8 +200,31 @@ server_port, public_port = free_port(), free_port()
 relay = Relay(server_port)
 server_text = server_file.read_text().replace("127.0.0.1:2333", address(server_port)).replace("127.0.0.1:5202", address(public_port)).replace("keep_alive_interval = 15", "keep_alive_interval = 2").replace("max_idle_timeout = 60", "max_idle_timeout = 8")
 client_text = client_file.read_text().replace("127.0.0.1:2333", address(relay.front.getsockname()[1])).replace("keep_alive_interval = 15", "keep_alive_interval = 2").replace("max_idle_timeout = 60", "max_idle_timeout = 8")
-client_text = client_text.replace('local_addr = "127.0.0.1:5201"', f'local_addr = "{address(tcp_echo.getsockname()[1])}"', 1)
-client_text = client_text.replace('local_addr = "127.0.0.1:5201"', f'local_addr = "{address(udp_echo.getsockname()[1])}"')
+local_host = "[::]" if args.ipv6 else "0.0.0.0"
+client_text = client_text.replace('local_addr = "127.0.0.1:5201"', f'local_addr = "{local_host}:{tcp_echo.getsockname()[1]}"', 1)
+client_text = client_text.replace('local_addr = "127.0.0.1:5201"', f'local_addr = "{local_host}:{udp_echo.getsockname()[1]}"')
+if args.pattern == "kk":
+    generated = subprocess.check_output([binary, "--genkey"], text=True)
+    client_private = re.search(r"Private Key:\s*([^\s]+)", generated).group(1)
+    client_public = re.search(r"Public Key:\s*([^\s]+)", generated).group(1)
+    server_text = server_text.replace("[server.transport.noise]", '[server.transport.noise]\npattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"')
+    server_text = server_text.replace("[server.transport.quic]", f'remote_public_key = "{client_public}"\n[server.transport.quic]')
+    client_text = client_text.replace("[client.transport.noise]", f'[client.transport.noise]\npattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"\nlocal_private_key = "{client_private}"')
+elif args.pattern == "xx":
+    server_text = server_text.replace("[server.transport.noise]", '[server.transport.noise]\npattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"')
+    client_text = client_text.replace("[client.transport.noise]", '[client.transport.noise]\npattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"')
+    server_text = re.sub(r'\nlocal_private_key = "[^"]+"', '', server_text)
+    client_text = re.sub(r'\nremote_public_key = "[^"]+"', '', client_text)
+if args.legacy_noise:
+    server_text = server_text.replace('type = "quic"', 'type = "noise"')
+    client_text = client_text.replace('type = "quic"', 'type = "noise"')
+    server_text = re.sub(r'\[server\.transport\.quic\][\s\S]*?(?=\n\[server\.services)', '', server_text)
+    client_text = re.sub(r'\[client\.transport\.quic\][\s\S]*?(?=\n\[client\.services)', '', client_text)
+    client_text = client_text.replace('default_token = ', 'heartbeat_timeout = 40\nretry_interval = 1\ndefault_token = ', 1)
+    server_text = server_text.replace('default_token = ', 'heartbeat_interval = 2\ndefault_token = ', 1)
+    if args.pattern == "nk":
+        client_key = re.search(r'local_private_key = "([^"]+)"', server_text).group(1)
+        client_text = client_text.replace("[client.transport.noise]", f'[client.transport.noise]\nlocal_private_key = "{client_key}"')
 server_file.write_text(server_text)
 client_file.write_text(client_text)
 started = time.monotonic()
@@ -210,7 +235,12 @@ try:
     # No listener may open for an invalid token or an incorrect Noise identity.
     alternate = work / "alternate"
     subprocess.run([binary, "--init", str(alternate)], check=True, stdout=subprocess.DEVNULL)
-    for field, replacement in [("default_token", "wrong-token"), ("remote_public_key", base64.b64encode(os.urandom(32)).decode()), ("trusted_root", (alternate / "server.der").resolve().as_posix())]:
+    bad_credentials = [("default_token", "wrong-token")]
+    if args.pattern != "xx":
+        bad_credentials.append(("remote_public_key", base64.b64encode(os.urandom(32)).decode()))
+    if not args.legacy_noise:
+        bad_credentials.append(("trusted_root", (alternate / "server.der").resolve().as_posix()))
+    for field, replacement in bad_credentials:
         bad_file = identity / f"bad-{field}.toml"
         bad_file.write_text(re.sub(rf'{field} = "[^"]+"', f'{field} = "{replacement}"', client_text))
         bad = launch(bad_file)
@@ -233,8 +263,15 @@ try:
         terminate(bad)
     client = launch(client_file)
     ready(public_port)
+    # Complete one stream before migration so the QUIC peer has time to issue
+    # post-handshake connection IDs. Rebinding immediately after registration
+    # races that protocol exchange on fast loopback runs.
+    tcp_roundtrip(public_port, b"before NAT port rebinding")
     relay.rebind_requested = True
-    time.sleep(0.1)
+    # With a compatibility config that omits transport.quic, the default client
+    # keepalive is 15 seconds. That outbound packet is what reveals a changed NAT
+    # mapping when no application traffic is flowing from client to server.
+    time.sleep(16 if args.legacy_noise else 0.5)
     tcp_roundtrip(public_port, b"same session after NAT port rebinding")
     tcp_roundtrip(public_port, os.urandom(2 * 1024 * 1024))
     with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
@@ -254,7 +291,9 @@ try:
     # Server restart forces fresh TLS + Noise and service registration.
     terminate(server)
     server = launch(server_file)
-    ready(public_port)
+    # A hard-killed server might not deliver CONNECTION_CLOSE. Allow the
+    # configured 40-second compatibility idle timeout before reconnecting.
+    ready(public_port, timeout=60 if args.legacy_noise else 45)
     tcp_roundtrip(public_port, b"after reconnect")
     # Both sides add a new service through watched config files.
     extra_port = free_port()

@@ -7,7 +7,8 @@ run Cathole.
 * TCP terminates at each proxy. Each connection uses an independent, reliable
   QUIC bidirectional stream. There is no TCP transport between the proxies.
 * UDP uses QUIC DATAGRAM, without application retransmission or ordering.
-* Noise NK authenticates the server and protects registration and payloads.
+* Noise NK, KK, or XX protects registration and payloads. NK authenticates the
+  server; KK authenticates both static keys; XX requires pinned outer TLS.
   Service tokens authorize the client separately for each declared service.
 * Standard QUIC TLS 1.3 remains enabled, with a dedicated trusted server
   certificate. **Noise is layered inside QUIC**, so encryption work is duplicated.
@@ -65,9 +66,11 @@ dropped when buffers fill. Incomplete fragmented packets expire after 2 seconds;
 no partial packet reaches the application. Fragmentation preserves payloads up
 to 65,507 bytes, but small UDP packets are strongly preferable on lossy paths.
 
-Default keepalive is 15 seconds and idle timeout is 60 seconds. An orderly close
-is detected promptly; a silent black hole takes up to the negotiated idle
-timeout. Reconnect retries grow from 1 to 30 seconds plus 0–1 second jitter,
+The compatibility defaults send a server heartbeat every 30 seconds and declare
+the client tunnel dead after 40 seconds; either value can be set to zero to
+disable it. An orderly close is detected promptly; a silent black hole takes up
+to the negotiated idle timeout. Reconnect retries grow from the configured
+`retry_interval` to 30 seconds plus 0–1 second jitter,
 resetting after a connection lasts 60 seconds. Existing TCP connections cannot
 survive a destroyed tunnel and must reconnect at the application layer.
 
@@ -103,7 +106,8 @@ Measured local results and checks are in [validation](docs/validation.md).
 Only TCP and UDP services are implemented. Raw IP, ICMP, Ethernet, P2P discovery,
 TURN/STUN, reliable-UDP service mode, seamless reload, and connection resumption
 across process restart are not implemented. IPv4 and IPv6 are supported; DNS
-currently chooses the first resolved address, without Happy Eyeballs.
+respects `prefer_ipv6` and otherwise chooses the first matching address, without
+Happy Eyeballs.
 
 Noise sessions have a 24-hour maximum lifetime; renewal closes existing flows.
 UDP Noise keys also have a hard 2^32-packet sending budget. Seamless key rotation

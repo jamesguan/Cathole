@@ -1,13 +1,19 @@
 use crate::config::Quic;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 fn transport(q: &Quic) -> Result<Arc<TransportConfig>> {
     let mut t = TransportConfig::default();
-    t.keep_alive_interval(Some(Duration::from_secs(q.keep_alive_interval)));
-    t.max_idle_timeout(Some(Duration::from_secs(q.max_idle_timeout).try_into()?));
+    t.keep_alive_interval(
+        (q.keep_alive_interval > 0).then(|| Duration::from_secs(q.keep_alive_interval)),
+    );
+    t.max_idle_timeout(if q.max_idle_timeout > 0 {
+        Some(Duration::from_secs(q.max_idle_timeout).try_into()?)
+    } else {
+        None
+    });
     t.max_concurrent_bidi_streams((q.max_streams + 1).into());
     t.max_concurrent_uni_streams(0u32.into());
     t.stream_receive_window(q.stream_receive_window.into());
@@ -43,12 +49,20 @@ fn socket(addr: SocketAddr, q: &Quic) -> Result<std::net::UdpSocket> {
 }
 
 pub fn server(addr: SocketAddr, q: &Quic) -> Result<Endpoint> {
-    let cert = CertificateDer::from(std::fs::read(
-        q.certificate.as_ref().context("certificate missing")?,
-    )?);
-    let key = PrivatePkcs8KeyDer::from(std::fs::read(
-        q.private_key.as_ref().context("private_key missing")?,
-    )?);
+    let (cert, key) = if let (Some(cert), Some(key)) = (&q.certificate, &q.private_key) {
+        (
+            CertificateDer::from(std::fs::read(cert)?),
+            PrivatePkcs8KeyDer::from(std::fs::read(key)?),
+        )
+    } else {
+        // QUIC requires TLS. In Noise compatibility mode this short-lived identity
+        // encrypts the outer handshake; the configured Noise key authenticates it.
+        let generated = rcgen::generate_simple_self_signed(vec![q.hostname.clone()])?;
+        (
+            generated.cert.der().clone(),
+            PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der()),
+        )
+    };
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key.into())?;
@@ -68,14 +82,17 @@ pub fn server(addr: SocketAddr, q: &Quic) -> Result<Endpoint> {
 }
 
 pub fn client(addr: SocketAddr, q: &Quic) -> Result<Endpoint> {
-    let cert = CertificateDer::from(std::fs::read(
-        q.trusted_root.as_ref().context("trusted_root missing")?,
-    )?);
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert)?;
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let builder = rustls::ClientConfig::builder();
+    let mut tls = if let Some(root) = &q.trusted_root {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(std::fs::read(root)?))?;
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(NoiseAuthenticatedOuterTls::new())
+            .with_no_client_auth()
+    };
     tls.alpn_protocols = vec![b"cathole/1".to_vec()];
     let mut cfg = ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
         tls,
@@ -89,4 +106,56 @@ pub fn client(addr: SocketAddr, q: &Quic) -> Result<Endpoint> {
     )?;
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
+}
+
+/// Certificate chain authentication is intentionally deferred to the inner
+/// Noise NK/KK handshake when a legacy Noise config has no QUIC trust root.
+/// TLS CertificateVerify signatures are still checked here.
+#[derive(Debug)]
+struct NoiseAuthenticatedOuterTls(Arc<rustls::crypto::CryptoProvider>);
+impl NoiseAuthenticatedOuterTls {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+    }
+}
+impl rustls::client::danger::ServerCertVerifier for NoiseAuthenticatedOuterTls {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }

@@ -41,11 +41,28 @@ impl Drop for CloseOnDrop {
     }
 }
 
-pub async fn resolve(addr: &str) -> Result<std::net::SocketAddr> {
-    tokio::time::timeout(SETUP, lookup_host(addr))
+pub async fn resolve(addr: &str, prefer_ipv6: bool) -> Result<std::net::SocketAddr> {
+    let addresses: Vec<_> = tokio::time::timeout(SETUP, lookup_host(addr))
         .await??
-        .next()
+        .collect();
+    addresses
+        .iter()
+        .copied()
+        .find(|a| a.is_ipv6() == prefer_ipv6)
+        .or_else(|| addresses.first().copied())
         .ok_or_else(|| anyhow::anyhow!("address resolved to no endpoints"))
+}
+
+async fn resolve_local(addr: &str, prefer_ipv6: bool) -> Result<std::net::SocketAddr> {
+    let mut target = resolve(addr, prefer_ipv6).await?;
+    if target.ip().is_unspecified() {
+        target.set_ip(if target.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    Ok(target)
 }
 
 fn context(service: u16, send: &SendStream) -> Vec<u8> {
@@ -64,16 +81,18 @@ async fn tcp_server(
     let (send, recv, hs) = tokio::time::timeout(SETUP, async {
         let (mut send, mut recv) = session.conn.open_bi().await?;
         crypto::write_frame(&mut send, &service.to_be_bytes()).await?;
-        let (mut hs, payload) = crypto::receive(
+        let ctx = context(service, &send);
+        let (mut state, payload) = crypto::receive_stream(
             &session.conn,
             &cfg.transport.noise,
+            &mut send,
             &mut recv,
-            &context(service, &send),
+            &ctx,
         )
         .await?;
         ensure!(payload.is_empty(), "unexpected TCP handshake payload");
-        crypto::respond(&mut hs, &mut send, b"ok").await?;
-        Ok::<_, anyhow::Error>((send, recv, hs.into_transport_mode()?))
+        crypto::write_transport(&mut state, &mut send, b"ok").await?;
+        Ok::<_, anyhow::Error>((send, recv, state))
     })
     .await??;
     crypto::bridge(tcp, send, recv, hs).await
@@ -98,12 +117,28 @@ async fn tcp_client(
             .ok_or_else(|| anyhow::anyhow!("unknown service"))?;
         ensure!(service.kind == Kind::Tcp, "wrong service type");
         let ctx = context(id, &send);
-        let (hs, reply) =
-            crypto::initiate(&conn, &cfg.transport.noise, &mut send, &mut recv, &ctx, b"").await?;
+        let (state, reply) =
+            crypto::initiate_stream(&conn, &cfg.transport.noise, &mut send, &mut recv, &ctx, b"")
+                .await?;
         ensure!(reply == b"ok", "TCP handshake rejected");
-        let tcp = TcpStream::connect(service.local_addr.as_ref().unwrap()).await?;
-        tcp.set_nodelay(service.nodelay)?;
-        Ok::<_, anyhow::Error>((tcp, hs.into_transport_mode()?))
+        let target = resolve_local(
+            service.local_addr.as_ref().unwrap(),
+            service.prefer_ipv6 || cfg.prefer_ipv6,
+        )
+        .await?;
+        let retry = cfg.service_retry(service);
+        let tcp = loop {
+            match TcpStream::connect(target).await {
+                Ok(tcp) => break tcp,
+                Err(e) if retry > 0 => {
+                    tracing::debug!(error = %e, "local TCP connect failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(retry)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        tcp.set_nodelay(cfg.nodelay(service))?;
+        Ok::<_, anyhow::Error>((tcp, state))
     })
     .await??;
     crypto::bridge(tcp, send, recv, hs).await

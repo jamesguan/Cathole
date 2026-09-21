@@ -4,22 +4,27 @@ Configuration uses `[server]` / `[client]`, `bind_addr` / `remote_addr`, named
 `services`, per-service `type`, `token`, `local_addr` / `bind_addr`,
 `default_token`, and `nodelay` (true by default).
 
-1. Generate fresh files with `cathole --init identity`.
-2. Copy your explicit service definitions into the matching generated configs.
-3. Set `[client.transport]` and `[server.transport]` to `type = "quic"`.
-4. Keep the generated Noise keys, or transfer your compatible NK keys. Only
-   `Noise_NK_25519_ChaChaPoly_BLAKE2s` is accepted. XX and other patterns are rejected.
-5. Keep the generated `transport.quic` identity paths. Clients need the server
-   certificate and Noise public key. The server needs both private identities.
-6. Change the client endpoint/public listener as appropriate. Allow **UDP** for
+1. Generate fresh keys with `cathole --genkey`, or complete example identities
+   with `cathole --init identity`.
+2. Existing `type = "noise"` files can retain their section names and service
+   definitions. The tunnel underneath them is always QUIC/UDP.
+3. NK, KK, and XX are accepted with X25519, ChaChaPoly, and BLAKE2s. NK needs the
+   server private key and the matching remote public key on the client. KK also
+   requires a pinned client key at the server. XX requires a pinned QUIC TLS
+   certificate because XX does not authenticate a known peer by itself.
+4. A `transport.quic` table is optional for NK and KK. When it is omitted, the
+   server creates an ephemeral outer TLS certificate and Noise authenticates the
+   connection before any token or payload is sent. Pin the generated TLS identity
+   when using XX or when you want two independent server identity checks.
+5. Change the client endpoint/public listener as appropriate. Allow **UDP** for
    the tunnel port; a TCP-only firewall rule is insufficient.
-7. Validate with `--check`, start both endpoints, and test each named service.
+6. Validate with `--check`, start both endpoints, and test each named service.
 
 Example additions to a client config:
 
 ```toml
 [client.transport]
-type = "quic"
+type = "noise"
 [client.transport.noise]
 remote_public_key = "YOUR_BASE64_NOISE_PUBLIC_KEY"
 [client.transport.quic]
@@ -38,9 +43,11 @@ uses `local_private_key`. Freshly generated identities are preferable to any
 example keys. Example configuration files intentionally contain no working
 shared credentials in the repository.
 
-Unknown fields are errors, not silently ignored settings. TCP/WebSocket tunnel
-options, legacy heartbeat/retry fields, and proxy protocol are unsupported. Put
-keepalive and timeout values in the QUIC table and remove obsolete options.
+Unknown fields are errors, not silently ignored settings. `heartbeat_timeout`,
+`heartbeat_interval`, `retry_interval`, `prefer_ipv6`, transport TCP `nodelay`,
+and per-service `nodelay`/`retry_interval` are accepted. TCP/WebSocket/TLS tunnel
+types and HTTP/SOCKS proxy settings are rejected because they cannot carry this
+UDP tunnel; change the transport type to `noise` or `quic`.
 Both endpoints must run Cathole and use its versioned wire protocol.
 
 Live edits restart all tunnel sessions, including unaffected services. Plan

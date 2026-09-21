@@ -5,13 +5,13 @@ application data is used. Only bidirectional streams are permitted.
 
 ## Registration
 
-The client opens the first stream, performs
-`Noise_NK_25519_ChaChaPoly_BLAKE2s`, and embeds a JSON registration in the first
-encrypted handshake payload. JSON contains `version: 1` and an ordered `services`
+The client opens the first stream and performs the configured NK, KK, or XX
+X25519/ChaChaPoly/BLAKE2s Noise handshake. After the handshake it sends a Noise
+transport-encrypted JSON registration. JSON contains `version: 1` and an ordered `services`
 list of `{name, kind, token}`. IDs are zero-based positions in this list. The
-client orders services lexicographically. Up to 256 services fit conceptually;
-the complete registration must also fit one Noise handshake message (65,535
-bytes including handshake overhead). Excessive combined names/tokens fail closed.
+client orders services lexicographically. Up to 256 services are accepted and
+each encrypted frame is capped at 65,535 bytes. Excessive combined names/tokens
+fail closed.
 
 Noise's prologue is `cathole/1` followed by 32 bytes exported from QUIC TLS using
 label `cathole-noise-v1` and context `registration`, followed by that context.
@@ -28,7 +28,7 @@ a frame is an error. No credentials are logged.
 
 Each public TCP connection opens a server-initiated QUIC bidirectional stream.
 The first TLS-protected frame contains the big-endian u16 service ID. A fresh
-Noise NK handshake follows, still with the home client as Noise initiator. Its
+configured Noise handshake follows, still with the home client as initiator. Its
 context is `tcp || service_id(u16) || quic_stream_id(u64)`, big-endian, and uses
 the same exporter/prologue construction. The handshake request is empty; the
 server response is `ok`.

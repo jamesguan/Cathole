@@ -1,4 +1,4 @@
-use crate::config::{Noise, PATTERN, key};
+use crate::config::{Noise, key};
 use anyhow::{Context, Result, ensure};
 use quinn::{Connection, RecvStream, SendStream};
 use snow::{HandshakeState, StatelessTransportState, TransportState};
@@ -42,51 +42,146 @@ fn handshake(
     let mut prologue = b"cathole/1".to_vec();
     prologue.extend_from_slice(&binding);
     prologue.extend_from_slice(context);
-    let b = snow::Builder::new(PATTERN.parse()?).prologue(&prologue)?;
-    let k = if initiator {
-        key(&cfg.remote_public_key)?
+    let mut b = snow::Builder::new(cfg.pattern.parse()?).prologue(&prologue)?;
+    let pattern = cfg.pattern.split('_').nth(1).unwrap_or("");
+    let generated;
+    let local = if cfg.local_private_key.is_some() {
+        Some(key(&cfg.local_private_key)?)
+    } else if pattern == "XX" {
+        generated = snow::Builder::new(cfg.pattern.parse()?)
+            .generate_keypair()?
+            .private;
+        Some(generated)
     } else {
-        key(&cfg.local_private_key)?
+        None
     };
-    Ok(if initiator {
-        b.remote_public_key(&k)?.build_initiator()?
+    let remote = if cfg.remote_public_key.is_some() {
+        Some(key(&cfg.remote_public_key)?)
     } else {
-        b.local_private_key(&k)?.build_responder()?
+        None
+    };
+    if let Some(k) = local.as_deref() {
+        b = b.local_private_key(k)?;
+    }
+    if let Some(k) = remote.as_deref() {
+        b = b.remote_public_key(k)?;
+    }
+    Ok(if initiator {
+        b.build_initiator()?
+    } else {
+        b.build_responder()?
     })
 }
 
-pub async fn initiate(
+async fn complete_handshake(
+    conn: &Connection,
+    cfg: &Noise,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    context: &[u8],
+    initiator: bool,
+) -> Result<HandshakeState> {
+    let mut hs = handshake(conn, cfg, initiator, context)?;
+    let mut buf = vec![0; MAX_FRAME];
+    let mut our_turn = initiator;
+    while !hs.is_handshake_finished() {
+        if our_turn {
+            let n = hs.write_message(&[], &mut buf)?;
+            write_frame(send, &buf[..n]).await?;
+        } else {
+            let message = read_frame(recv)
+                .await?
+                .context("missing Noise handshake message")?;
+            hs.read_message(&message, &mut buf)?;
+        }
+        our_turn = !our_turn;
+    }
+    Ok(hs)
+}
+
+pub async fn initiate_stream(
     conn: &Connection,
     cfg: &Noise,
     send: &mut SendStream,
     recv: &mut RecvStream,
     context: &[u8],
     payload: &[u8],
-) -> Result<(HandshakeState, Vec<u8>)> {
-    let mut hs = handshake(conn, cfg, true, context)?;
-    let mut buf = vec![0; MAX_FRAME];
-    let n = hs.write_message(payload, &mut buf)?;
-    write_frame(send, &buf[..n]).await?;
-    let reply = read_frame(recv).await?.context("missing Noise response")?;
-    let n = hs.read_message(&reply, &mut buf)?;
-    Ok((hs, buf[..n].to_vec()))
+) -> Result<(TransportState, Vec<u8>)> {
+    let mut state = complete_handshake(conn, cfg, send, recv, context, true)
+        .await?
+        .into_transport_mode()?;
+    write_transport(&mut state, send, payload).await?;
+    let reply = read_transport(&mut state, recv)
+        .await?
+        .context("missing Noise response")?;
+    Ok((state, reply))
 }
-pub async fn receive(
+pub async fn receive_stream(
     conn: &Connection,
     cfg: &Noise,
+    send: &mut SendStream,
     recv: &mut RecvStream,
     context: &[u8],
-) -> Result<(HandshakeState, Vec<u8>)> {
-    let mut hs = handshake(conn, cfg, false, context)?;
-    let message = read_frame(recv).await?.context("missing Noise request")?;
-    let mut buf = vec![0; MAX_FRAME];
-    let n = hs.read_message(&message, &mut buf)?;
-    Ok((hs, buf[..n].to_vec()))
+) -> Result<(TransportState, Vec<u8>)> {
+    let mut state = complete_handshake(conn, cfg, send, recv, context, false)
+        .await?
+        .into_transport_mode()?;
+    let payload = read_transport(&mut state, recv)
+        .await?
+        .context("missing Noise request")?;
+    Ok((state, payload))
 }
-pub async fn respond(hs: &mut HandshakeState, send: &mut SendStream, payload: &[u8]) -> Result<()> {
-    let mut buf = vec![0; MAX_FRAME];
-    let n = hs.write_message(payload, &mut buf)?;
+pub async fn write_transport(
+    state: &mut TransportState,
+    send: &mut SendStream,
+    payload: &[u8],
+) -> Result<()> {
+    let mut buf = vec![0; payload.len() + 16];
+    let n = state.write_message(payload, &mut buf)?;
     write_frame(send, &buf[..n]).await
+}
+async fn read_transport(
+    state: &mut TransportState,
+    recv: &mut RecvStream,
+) -> Result<Option<Vec<u8>>> {
+    let Some(cipher) = read_frame(recv).await? else {
+        return Ok(None);
+    };
+    let mut plain = vec![0; cipher.len()];
+    let n = state.read_message(&cipher, &mut plain)?;
+    plain.truncate(n);
+    Ok(Some(plain))
+}
+
+pub async fn initiate_datagram(
+    conn: &Connection,
+    cfg: &Noise,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    context: &[u8],
+    payload: &[u8],
+) -> Result<(DatagramCrypto, Vec<u8>)> {
+    let state = complete_handshake(conn, cfg, send, recv, context, true)
+        .await?
+        .into_stateless_transport_mode()?;
+    let mut crypto = DatagramCrypto::new(state);
+    write_frame(send, &crypto.seal(payload)?).await?;
+    let reply = crypto.open(&read_frame(recv).await?.context("missing Noise response")?)?;
+    Ok((crypto, reply))
+}
+pub async fn receive_datagram(
+    conn: &Connection,
+    cfg: &Noise,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    context: &[u8],
+) -> Result<(DatagramCrypto, Vec<u8>)> {
+    let state = complete_handshake(conn, cfg, send, recv, context, false)
+        .await?
+        .into_stateless_transport_mode()?;
+    let mut crypto = DatagramCrypto::new(state);
+    let payload = crypto.open(&read_frame(recv).await?.context("missing Noise request")?)?;
+    Ok((crypto, payload))
 }
 
 pub async fn bridge(
@@ -203,6 +298,7 @@ impl ReplayWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PATTERN;
     fn pair() -> (DatagramCrypto, DatagramCrypto) {
         let keys = snow::Builder::new(PATTERN.parse().unwrap())
             .generate_keypair()

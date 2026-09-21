@@ -1,0 +1,19 @@
+[client]
+remote_addr = "tunnel.example.com:2000"
+default_token = "example-token"
+heartbeat_timeout = 40
+retry_interval = 1
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+remote_public_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA="
+
+[client.services.first]
+local_addr = "127.0.0.1:6969"
+
+[client.services.second]
+local_addr = "127.0.0.1:2283"

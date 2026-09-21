@@ -38,7 +38,7 @@ impl Flows {
 
 pub async fn run(cfg: Arc<Side>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let endpoint = transport::server(
-        resolve(cfg.bind_addr.as_ref().unwrap()).await?,
+        resolve(cfg.bind_addr.as_ref().unwrap(), cfg.prefer_ipv6).await?,
         &cfg.transport.quic,
     )?;
     tracing::info!(address = %endpoint.local_addr()?, "QUIC server listening");
@@ -77,8 +77,14 @@ pub async fn run(cfg: Arc<Side>, mut shutdown: tokio::sync::watch::Receiver<bool
 async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
     let (session, bound) = tokio::time::timeout(SETUP, async {
         let (mut send, mut recv) = conn.accept_bi().await?;
-        let (mut hs, payload) =
-            crypto::receive(&conn, &cfg.transport.noise, &mut recv, b"registration").await?;
+        let (mut data_crypto, payload) = crypto::receive_datagram(
+            &conn,
+            &cfg.transport.noise,
+            &mut send,
+            &mut recv,
+            b"registration",
+        )
+        .await?;
         let reg: Registration = serde_json::from_slice(&payload)?;
         ensure!(
             reg.version == 1 && !reg.services.is_empty() && reg.services.len() <= 256,
@@ -109,16 +115,14 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
             };
             bound.push((name, service, listener));
         }
-        crypto::respond(&mut hs, &mut send, b"ok").await?;
+        crypto::write_frame(&mut send, &data_crypto.seal(b"ok")?).await?;
         send.finish()?;
         // Require orderly completion of control request, not abandoned auth streams.
         ensure!(
             crypto::read_frame(&mut recv).await?.is_none(),
             "unexpected control data"
         );
-        let data = Arc::new(datagram::Sender::new(crypto::DatagramCrypto::new(
-            hs.into_stateless_transport_mode()?,
-        )));
+        let data = Arc::new(datagram::Sender::new(data_crypto));
         Ok::<_, anyhow::Error>((
             Arc::new(Session {
                 conn: conn.clone(),
@@ -194,7 +198,7 @@ async fn tcp_listener(
             accepted = listener.accept() => {
                 let (tcp, _) = accepted?;
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
-                tcp.set_nodelay(service.nodelay)?;
+                tcp.set_nodelay(cfg.nodelay(&service))?;
                 let session = session.clone(); let cfg = cfg.clone();
                 tasks.spawn(async move {
                     let _permit = permit;

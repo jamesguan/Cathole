@@ -8,12 +8,14 @@ capacity certification. No production server was changed.
 
 - `cargo fmt --check`
 - `cargo clippy --locked --offline --all-targets -- -D warnings`
-- `cargo test --offline`: 9 unit tests
+- `cargo test --offline`: 10 unit tests
 - Release build and black-box TCP/UDP tests on IPv4 and IPv6
 - Outer UDP loss/reordering tests: 0%, 0.5%, 1%, 2%, 5%
 - TCP bulk integrity, half-close and 24 concurrent connections
 - UDP empty packets, boundary sizes, 65,507-byte fragmentation and source isolation
 - Rejection of wrong service tokens, Noise pins and TLS trust roots
+- Legacy `type = "noise"` configs without QUIC certificate tables using NK and
+  mutual-static-key KK, plus certificate-pinned XX
 - NAT source-port rebinding, killed-server reconnect, invalid reload retention,
   live service addition and removal
 
@@ -31,12 +33,12 @@ reported number includes startup/ramp-up and is a single sample per condition.
 
 | Concurrent streams | Direct echo | Cathole echo |
 | ---: | ---: | ---: |
-| 1 | 1.382 Gbps | 0.515 Gbps |
-| 4 | 8.235 Gbps | 1.467 Gbps |
-| 16 | 14.966 Gbps | 1.645 Gbps |
+| 1 | 1.419 Gbps | 0.535 Gbps |
+| 4 | 10.304 Gbps | 1.671 Gbps |
+| 16 | 13.583 Gbps | 1.942 Gbps |
 
 Cathole persistent-connection 64-byte TCP median RTT was approximately
-0.18–0.20 ms. All 100 UDP echo probes returned in each condition. Full JSON
+0.08–0.11 ms. All 100 UDP echo probes returned in each condition. Full JSON
 is in [benchmark-results-local.json](benchmark-results-local.json).
 
 The aggregate local result exceeds 1 Gbps with multiple streams. The single
