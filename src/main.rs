@@ -118,6 +118,19 @@ local_addr = "127.0.0.1:5201"
 
 fn validate_files(c: &Config) -> Result<()> {
     let s = c.server.as_ref().or(c.client.as_ref()).unwrap();
+    if s.tcp_tunnel() {
+        if s.transport.kind == "tls" {
+            if c.server.is_some() {
+                let _ = cathole::transport::rustls_server(&s.transport.quic)?;
+            } else {
+                let root = s
+                    .tls_trusted_root()
+                    .context("type=tls requires trusted_root")?;
+                let _ = cathole::transport::rustls_client(root)?;
+            }
+        }
+        return Ok(());
+    }
     let q = &s.transport.quic;
     // Build TLS configs on a temporary loopback endpoint to verify keys/certs.
     // This never opens a configured public listener.
@@ -139,10 +152,23 @@ fn launch(
     let (stop, mut rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(async move {
         if let Some(s) = c.server {
-            proxy::run_server(Arc::new(s), rx).await
+            let s = Arc::new(s);
+            if s.tcp_tunnel() {
+                proxy::run_tcp_server(s, rx).await
+            } else {
+                proxy::run_server(s, rx).await
+            }
         } else {
+            let s = Arc::new(c.client.unwrap());
+            let tcp = s.tcp_tunnel();
             tokio::select! {
-                r = proxy::run_client(Arc::new(c.client.unwrap())) => r,
+                r = async move {
+                    if tcp {
+                        proxy::run_tcp_client(s).await
+                    } else {
+                        proxy::run_client(s).await
+                    }
+                } => r,
                 _ = rx.changed() => Ok(()),
             }
         }
@@ -150,8 +176,19 @@ fn launch(
     (stop, task)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn worker_threads() -> usize {
+    if let Ok(n) = std::env::var("TOKIO_WORKER_THREADS")
+        && let Ok(n) = n.parse::<usize>()
+    {
+        return n.max(1);
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
+        .max(2)
+}
+
+fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -160,6 +197,18 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    let workers = worker_threads();
+    tracing::info!(worker_threads = workers, "starting multi-thread runtime");
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(workers)
+        .max_blocking_threads(workers)
+        .thread_name("cathole")
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args = Args::parse();
     if let Some(curve) = args.genkey {
         let pattern = match curve {

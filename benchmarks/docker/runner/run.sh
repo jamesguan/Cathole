@@ -7,9 +7,14 @@ STRESS_DURATION=${STRESS_DURATION:-10}
 SAMPLES=${SAMPLES:-1}
 SATURATION_STEPS=${SATURATION_STEPS:-"64 256 1000"}
 WRK_TIMEOUT=${WRK_TIMEOUT:-30s}
-TESTS=${TESTS:-"correctness,latency,saturation,stress,stream"}
+TESTS=${TESTS:-"correctness,latency,saturation,stress,stream,tcp_packets,udp_packets,https"}
 VIDEO_BYTES=${VIDEO_BYTES:-10737418240}
 STREAM_TIMEOUT=${STREAM_TIMEOUT:-900}
+TCP_MIB=${TCP_MIB:-32}
+TCP_PARALLEL=${TCP_PARALLEL:-4}
+UDP_SAMPLES=${UDP_SAMPLES:-200}
+HTTPS_DURATION=${HTTPS_DURATION:-5}
+HTTPS_WORKERS=${HTTPS_WORKERS:-32}
 RESULTS_DIR=${RESULTS_DIR:-/results}
 RAW="$RESULTS_DIR/raw.jsonl"
 TARGET=${TARGET:-}
@@ -22,6 +27,30 @@ declare -A URLS=(
   [wireguard]=http://wireguard-server:8080
   [frp]=http://frp-server:8080
   [cathole]=http://cathole-server:8080
+)
+
+declare -A TCP_ECHO=(
+  [direct]=backend:3001
+  [rathole]=rathole-server:8081
+  [wireguard]=wireguard-server:8081
+  [frp]=frp-server:8081
+  [cathole]=cathole-server:8081
+)
+
+declare -A UDP_ECHO=(
+  [direct]=backend:3002
+  [rathole]=rathole-server:8082
+  [wireguard]=wireguard-server:8082
+  [frp]=frp-server:8082
+  [cathole]=cathole-server:8082
+)
+
+declare -A HTTPS_URLS=(
+  [direct]=https://backend:3443
+  [rathole]=https://rathole-server:8443
+  [wireguard]=https://wireguard-server:8443
+  [frp]=https://frp-server:8443
+  [cathole]=https://cathole-server:8443
 )
 
 wait_for_target() {
@@ -138,6 +167,54 @@ run_seek() {
       errors:(if $ok then 0 else 1 end)
     }' >> "$RAW"
   [[ $ok == true ]]
+}
+
+run_tcp_packets() {
+  local sample=$1
+  local endpoint=${TCP_ECHO[$TARGET]}
+  local host=${endpoint%:*} port=${endpoint##*:}
+  local json
+  echo
+  echo "[tcp_packets sample $sample/$SAMPLES] $TARGET: TCP echo $endpoint (${TCP_MIB} MiB x ${TCP_PARALLEL})"
+  json=$(python3 /bench/probe.py tcp "$host" "$port" --samples 100 --mib "$TCP_MIB" --parallel "$TCP_PARALLEL")
+  printf '%s\n' "$json"
+  jq -cn \
+    --arg test tcp_packets --arg target "$TARGET" --argjson sample "$sample" --argjson metrics "$json" \
+    '$metrics + {test:$test,target:$target,sample:$sample,connections:$metrics.parallel // 4,threads:1,path:"tcp-echo"}' \
+    >> "$RAW"
+  [[ $(jq -r '.ok' <<<"$json") == true ]]
+}
+
+run_udp_packets() {
+  local sample=$1
+  local endpoint=${UDP_ECHO[$TARGET]}
+  local host=${endpoint%:*} port=${endpoint##*:}
+  local json
+  echo
+  echo "[udp_packets sample $sample/$SAMPLES] $TARGET: UDP echo $endpoint ($UDP_SAMPLES probes)"
+  json=$(python3 /bench/probe.py udp "$host" "$port" --samples "$UDP_SAMPLES")
+  printf '%s\n' "$json"
+  jq -cn \
+    --arg test udp_packets --arg target "$TARGET" --argjson sample "$sample" --argjson metrics "$json" \
+    '$metrics + {test:$test,target:$target,sample:$sample,connections:1,threads:1,path:"udp-echo"}' \
+    >> "$RAW"
+  [[ $(jq -r '.ok' <<<"$json") == true ]]
+}
+
+run_https() {
+  local sample=$1
+  local endpoint=${HTTPS_URLS[$TARGET]}
+  local json
+  echo
+  echo "[https sample $sample/$SAMPLES] $TARGET: HTTPS $endpoint/ (${HTTPS_DURATION}s x ${HTTPS_WORKERS})"
+  json=$(python3 /bench/probe.py https "$endpoint" --samples 50 --duration "$HTTPS_DURATION" --workers "$HTTPS_WORKERS" --path /)
+  printf '%s\n' "$json"
+  jq -cn \
+    --arg test https --arg target "$TARGET" --argjson sample "$sample" \
+    --argjson workers "$HTTPS_WORKERS" --argjson metrics "$json" \
+    '$metrics + {test:$test,target:$target,sample:$sample,connections:$workers,threads:$workers,path:"/"}' \
+    >> "$RAW"
+  [[ $(jq -r '.ok' <<<"$json") == true ]]
 }
 
 generate_report() {
@@ -357,7 +434,79 @@ generate_report() {
       | "| \(.target) | \(if .seek_ok then "PASS" else "FAIL" end) | \(fmt(.seek_bps / 1048576)) |"
     ' "$RESULTS_DIR/latest.json"
     echo
-    echo 'Correctness performs 30 requests per target and verifies the hello response plus exact 64 KiB and 1 MiB bodies. Stream tests also check `/video` Content-Length and one Range response.'
+    echo '## TCP echo packets'
+    echo
+    echo 'Raw TCP echo (not HTTP): 64-byte RTT samples plus parallel bulk upload/download of mirrored payload.'
+    echo
+    echo '| Rank | Target | MiB/s | p50 ms | p99 ms | Complete |'
+    echo '| ---: | --- | ---: | ---: | ---: | --- |'
+    jq -r '
+      def median: sort | .[(length - 1) / 2 | floor];
+      def fmt(n): if n == null then "n/a" else ((n * 100 | floor) / 100 | tostring) end;
+      [.results[] | select(.test == "tcp_packets")]
+      | group_by(.target)
+      | map({
+          target: .[0].target,
+          bps: (map(.bytes_per_second // 0) | median),
+          p50: (map(.latency_ms_p50) | median),
+          p99: (map(.latency_ms_p99) | median),
+          ok: ([.[].ok] | all)
+        })
+      | sort_by(-.bps)
+      | to_entries[]
+      | "| \(.key + 1) | \(.value.target) | \(fmt(.value.bps / 1048576)) | \(fmt(.value.p50)) | \(fmt(.value.p99)) | \(if .value.ok then "PASS" else "FAIL" end) |"
+    ' "$RESULTS_DIR/latest.json"
+    echo
+    echo '## UDP echo packets'
+    echo
+    echo 'Fixed-rate 200-byte UDP echo probes. Loss does not throttle probe generation.'
+    echo
+    echo '| Rank | Target | Received | Loss | p50 ms | p99 ms | Complete |'
+    echo '| ---: | --- | ---: | ---: | ---: | ---: | --- |'
+    jq -r '
+      def median: sort | .[(length - 1) / 2 | floor];
+      def fmt(n): if n == null then "n/a" else ((n * 100 | floor) / 100 | tostring) end;
+      def pct(n): if n == null then "n/a" else (((n * 10000 | floor) / 100 | tostring) + "%") end;
+      [.results[] | select(.test == "udp_packets")]
+      | group_by(.target)
+      | map({
+          target: .[0].target,
+          received: (map(.received // 0) | median),
+          loss: (map(.loss_rate // 1) | median),
+          p50: (map(.latency_ms_p50) | median),
+          p99: (map(.latency_ms_p99) | median),
+          ok: ([.[].ok] | all)
+        })
+      | sort_by(.loss)
+      | to_entries[]
+      | "| \(.key + 1) | \(.value.target) | \(.value.received | floor) | \(pct(.value.loss)) | \(fmt(.value.p50)) | \(fmt(.value.p99)) | \(if .value.ok then "PASS" else "FAIL" end) |"
+    ' "$RESULTS_DIR/latest.json"
+    echo
+    echo '## HTTPS requests'
+    echo
+    echo 'TLS terminated on the backend; proxies forward raw TCP. Self-signed cert (verification disabled in the probe).'
+    echo
+    echo '| Rank | Target | RPS | p50 ms | p99 ms | Errors | Complete |'
+    echo '| ---: | --- | ---: | ---: | ---: | ---: | --- |'
+    jq -r '
+      def median: sort | .[(length - 1) / 2 | floor];
+      def fmt(n): if n == null then "n/a" else ((n * 100 | floor) / 100 | tostring) end;
+      [.results[] | select(.test == "https")]
+      | group_by(.target)
+      | map({
+          target: .[0].target,
+          rps: (map(.requests_per_second // 0) | median),
+          p50: (map(.latency_ms_p50) | median),
+          p99: (map(.latency_ms_p99) | median),
+          errors: (map(.errors // 0) | add),
+          ok: ([.[].ok] | all)
+        })
+      | sort_by(-.rps)
+      | to_entries[]
+      | "| \(.key + 1) | \(.value.target) | \(.value.rps | floor) | \(fmt(.value.p50)) | \(fmt(.value.p99)) | \(.value.errors) | \(if .value.ok then "PASS" else "FAIL" end) |"
+    ' "$RESULTS_DIR/latest.json"
+    echo
+    echo 'Correctness performs 30 requests per target and verifies the hello response plus exact 64 KiB and 1 MiB bodies. Stream tests also check `/video` Content-Length and one Range response. Optional TCP/UDP/HTTPS probes exercise echo and TLS paths.'
     echo
     echo '| Target | Correctness |'
     echo '| --- | --- |'
@@ -473,6 +622,32 @@ fi
 if has_test seek; then
   for sample in $(seq 1 "$SAMPLES"); do
     run_seek "$sample"
+    sleep 1
+  done
+fi
+
+if has_test tcp_packets || has_test udp_packets || has_test https; then
+  # Let data-channel warm pools refill after wrk/stream pressure.
+  sleep 3
+fi
+
+if has_test tcp_packets; then
+  for sample in $(seq 1 "$SAMPLES"); do
+    run_tcp_packets "$sample" || true
+    sleep 1
+  done
+fi
+
+if has_test udp_packets; then
+  for sample in $(seq 1 "$SAMPLES"); do
+    run_udp_packets "$sample" || true
+    sleep 1
+  done
+fi
+
+if has_test https; then
+  for sample in $(seq 1 "$SAMPLES"); do
+    run_https "$sample" || true
     sleep 1
   done
 fi

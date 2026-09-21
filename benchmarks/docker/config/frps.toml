@@ -8,5 +8,6 @@ transport.tls.force = true
 log.to = "console"
 log.level = "warn"
 allowPorts = [
-  { start = 8080, end = 8080 }
+  { start = 8080, end = 8082 },
+  { start = 8443, end = 8443 },
 ]

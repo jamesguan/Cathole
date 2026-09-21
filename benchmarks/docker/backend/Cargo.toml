@@ -6,11 +6,13 @@ publish = false
 
 [dependencies]
 axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 bytes = "1"
 futures-util = "0.3"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
-

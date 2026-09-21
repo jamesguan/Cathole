@@ -77,17 +77,13 @@ pub async fn run(cfg: Arc<Side>, mut shutdown: tokio::sync::watch::Receiver<bool
 async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
     let (session, bound) = tokio::time::timeout(SETUP, async {
         let (mut send, mut recv) = conn.accept_bi().await?;
-        let (mut data_crypto, payload) = crypto::receive_datagram(
-            &conn,
-            &cfg.transport.noise,
-            &mut send,
-            &mut recv,
-            b"registration",
-        )
-        .await?;
+        let (mut noise, payload) =
+            crypto::receive_session(&conn, &cfg.transport.noise, &mut send, &mut recv).await?;
         let reg: Registration = serde_json::from_slice(&payload)?;
         ensure!(
-            reg.version == 1 && !reg.services.is_empty() && reg.services.len() <= 256,
+            reg.version == REGISTRATION_VERSION
+                && !reg.services.is_empty()
+                && reg.services.len() <= 256,
             "invalid registration"
         );
         let mut names = HashSet::new();
@@ -115,14 +111,13 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
             };
             bound.push((name, service, listener));
         }
-        crypto::write_frame(&mut send, &data_crypto.seal(b"ok")?).await?;
+        crypto::confirm_session(&mut noise, &mut send).await?;
         send.finish()?;
-        // Require orderly completion of control request, not abandoned auth streams.
         ensure!(
             crypto::read_frame(&mut recv).await?.is_none(),
             "unexpected control data"
         );
-        let data = Arc::new(datagram::Sender::new(data_crypto));
+        let data = Arc::new(datagram::Sender::new());
         Ok::<_, anyhow::Error>((
             Arc::new(Session {
                 conn: conn.clone(),
@@ -197,10 +192,12 @@ async fn tcp_listener(
             Some(_) = tasks.join_next() => (),
             accepted = listener.accept() => {
                 let (tcp, _) = accepted?;
-                let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
                 tcp.set_nodelay(cfg.nodelay(&service))?;
-                let session = session.clone(); let cfg = cfg.clone();
+                let session = session.clone();
+                let cfg = cfg.clone();
+                let slots = slots.clone();
                 tasks.spawn(async move {
+                    let Ok(permit) = slots.acquire_owned().await else { return; };
                     let _permit = permit;
                     if let Err(e) = tcp_server(session, cfg, id, tcp).await { tracing::debug!(error = %e, "TCP forwarding ended"); }
                 });

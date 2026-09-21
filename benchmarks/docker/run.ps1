@@ -21,7 +21,7 @@ if (-not $env:THREADS) { $env:THREADS = '16' }
 if (-not $env:DURATION) { $env:DURATION = '10' }
 if (-not $env:STRESS_DURATION) { $env:STRESS_DURATION = '10' }
 if (-not $env:SAMPLES) { $env:SAMPLES = '1' }
-if (-not $env:TESTS) { $env:TESTS = 'correctness,latency,saturation,stress,stream' }
+if (-not $env:TESTS) { $env:TESTS = 'correctness,latency,saturation,stress,stream,tcp_packets,udp_packets,https' }
 if (-not $env:VIDEO_BYTES) { $env:VIDEO_BYTES = '10737418240' }
 if (-not $env:STREAM_TIMEOUT) { $env:STREAM_TIMEOUT = '900' }
 
@@ -56,7 +56,8 @@ try {
     Invoke-Docker -ComposeArgs @('compose', '--profile', 'benchmark', 'build')
     Invoke-Docker -ComposeArgs @('compose', '--profile', 'benchmark', 'down', '--volumes', '--remove-orphans')
     New-Item -ItemType Directory -Force -Path .\results | Out-Null
-    python -c @"
+    if ($env:PRESERVE_WRK -eq '1') {
+        python -c @"
 import json, pathlib
 src = pathlib.Path(r'results/latest.json')
 out = pathlib.Path(r'results/raw.jsonl')
@@ -70,12 +71,18 @@ if src.exists():
 out.write_text(('\n'.join(lines) + ('\n' if lines else '')), encoding='utf-8')
 print('preserved', len(lines), 'prior wrk samples')
 "@
-
+    }
+    else {
+        Set-Content -Path .\results\raw.jsonl -Value '' -Encoding utf8
+        Write-Host 'starting with empty raw.jsonl (set PRESERVE_WRK=1 to keep prior wrk samples)'
+    }
     Invoke-Docker -ComposeArgs @('compose', 'up', '-d', 'backend')
 
     foreach ($target in $targets) {
         Write-Host "========== Isolated target: $($target.Name) =========="
         Stop-ProxyStacks
+        # Fresh backend per target so TLS/echo sockets from prior stacks cannot accumulate.
+        Invoke-Docker -ComposeArgs @('compose', 'up', '-d', '--force-recreate', 'backend')
         if ($target.Services.Count -gt 0) {
             Invoke-Docker -ComposeArgs (@('compose', 'up', '-d', '--force-recreate') + $target.Services)
         }

@@ -71,3 +71,18 @@ latency and packet loss as well as averages. Lost UDP messages are expected;
 lost TCP bytes, cross-client routing, unbounded memory, or stalled unrelated
 streams are failures. Shared QUIC congestion control means unrelated streams
 are not guaranteed unchanged latency under a saturated connection.
+
+## CPU profiles with samply
+
+Use the `profiling` Cargo profile (`inherits = "release"`, line tables on).
+Install [samply](https://github.com/mstange/samply), then record while a load
+generator is running:
+
+```sh
+cargo build --profile profiling
+samply record -- ./target/profiling/cathole identity/server.toml
+```
+
+On Windows, `samply record` requires an elevated prompt and `xperf` from the
+Windows Performance Toolkit. Without that, you can still attach on Linux/macOS
+or import a `perf.data` file with `samply import`.

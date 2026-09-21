@@ -1,61 +1,67 @@
-# Cathole wire protocol v1
+# Cathole wire protocol v2
 
-Outer transport is QUIC v1 over UDP, ALPN `cathole/1`, validated TLS 1.3. No 0-RTT
-application data is used. Only bidirectional streams are permitted.
+Outer transport is either QUIC v1 over UDP (ALPN `cathole/2`) or a multiplexed
+TCP (optional TLS) byte stream. No 0-RTT application data is used. QUIC permits
+only bidirectional streams.
 
 ## Registration
 
-The client opens the first stream and performs the configured NK, KK, or XX
-X25519/ChaChaPoly/BLAKE2s Noise handshake. After the handshake it sends a Noise
-transport-encrypted JSON registration. JSON contains `version: 1` and an ordered `services`
-list of `{name, kind, token}`. IDs are zero-based positions in this list. The
-client orders services lexicographically. Up to 256 services are accepted and
-each encrypted frame is capped at 65,535 bytes. Excessive combined names/tokens
-fail closed.
+The client opens the first stream (QUIC) or the tunnel connection (TCP) and
+performs the configured NK, KK, or XX X25519/ChaChaPoly/BLAKE2s Noise handshake
+**once per session**. After the handshake it sends a Noise transport-encrypted
+JSON registration. JSON contains `version: 2` and an ordered `services` list of
+`{name, kind, token}`. IDs are zero-based positions in this list. Up to 256
+services are accepted and each encrypted frame is capped at 65,535 bytes.
 
-Noise's prologue is `cathole/1` followed by 32 bytes exported from QUIC TLS using
-label `cathole-noise-v1` and context `registration`, followed by that context.
-The server authenticates every service, binds all its listeners, and answers
-with encrypted `ok`. Both directions finish the control stream. A 10-second
-deadline covers the entire setup. The resulting Noise split keys are used only
-for UDP payloads, through snow's stateless transport API.
+On QUIC, Noise's prologue is `cathole/2` followed by 32 bytes exported from QUIC
+TLS using label `cathole-noise-v1` and context `registration`, followed by that
+context. On TCP, the prologue is `cathole/2` || `tcp` || `registration`. The
+server authenticates every service, binds all its listeners, and answers with
+encrypted `ok`. A 10-second deadline covers the entire setup.
 
-Every framed handshake or TCP record starts with a big-endian u32 length.
-Frames are capped at 65,535 bytes. FIN at a frame boundary is orderly; FIN within
-a frame is an error. No credentials are logged.
+Session Noise authenticates the tunnel. It does not encrypt subsequent QUIC
+payloads: those are already TLS 1.3. TCP/Noise tunnels keep Noise AEAD on the
+mux because the outer TCP path is otherwise plaintext. `type = tls` wraps the
+mux in rustls and still authenticates with the same session handshake.
 
-## TCP
+## TCP over QUIC
 
 Each public TCP connection opens a server-initiated QUIC bidirectional stream.
-The first TLS-protected frame contains the big-endian u16 service ID. A fresh
-configured Noise handshake follows, still with the home client as initiator. Its
-context is `tcp || service_id(u16) || quic_stream_id(u64)`, big-endian, and uses
-the same exporter/prologue construction. The handshake request is empty; the
-server response is `ok`.
+The first two bytes are the big-endian u16 service ID. The remainder is a raw
+byte relay with reusable 256 KiB buffers (`write_chunk` / `read_chunk`). There
+is no per-stream Noise handshake and no application framing of ordinary TCP
+data.
 
-Subsequent frames are Noise transport ciphertext. Plaintext chunks are at most
-16,384 bytes; authentication tags add 16 bytes. Separate Noise send and receive
-nonces are maintained by snow. A short synchronous mutex protects the state, not
-any network operation. TCP FIN shuts down only the matching stream direction,
-allowing a response after a request half-close. Errors reset/drop the affected
-stream and socket. Each TCP stream gets fresh keys.
+## TCP/Noise control and data channels
+
+After session authentication on the **control** connection, the control mux
+carries only UDP and signaling frames (Noise-sealed, length-prefixed):
+
+| Type | Layout |
+| --- | --- |
+| UDP (4) | `u16` service, `u64` flow, payload |
+| HEARTBEAT (5) | empty |
+| CREATE_DATA (6) | `u16` service ID |
+
+Each public TCP visitor uses a dedicated **data channel**: the client opens a
+new TCP connection, completes the same Noise handshake, and sends a three-byte
+payload `0xD0 || service_id` instead of registration JSON. After `ok`, both
+sides relay local TCP bytes as Noise-framed chunks (up to ~60 KiB plaintext)
+with no stream IDs. The client keeps a warm pool of data channels; the server
+sends `CREATE_DATA` when the pool is empty. Service IDs are zero-based indexes
+into the registration list sorted by service name.
+
+Send and receive Noise nonces are independent per connection. Ciphertext
+buffers are reused from a per-worker pool.
 
 ## UDP
 
 The server assigns a monotonically increasing flow ID for each
 `(service ID, public source IP, public source port)` mapping. The client creates
-a connected UDP socket to that service's configured destination. Only that
-destination can supply replies to the socket. Replies use the same service/flow
-IDs; the server routes only matching live mappings. Idle mappings expire.
+a connected UDP socket to that service's configured destination.
 
-Each QUIC DATAGRAM contains:
-
-| Field | Size |
-| --- | ---: |
-| Explicit Noise nonce, big-endian | 8 bytes |
-| Noise ciphertext and authentication tag | variable |
-
-The encrypted plaintext contains:
+On QUIC, each DATAGRAM contains the fragment header plus payload. QUIC packet
+protection encrypts it; there is no second application AEAD.
 
 | Field | Size |
 | --- | ---: |
@@ -66,31 +72,17 @@ The encrypted plaintext contains:
 | Fragment index | u16 |
 | Fragment payload | 0–1000 bytes |
 
-Integers are big-endian. Fragment count is `max(1, ceil(length / 1000))`.
-Non-final fragments must contain exactly 1000 bytes; the final length must match
-the advertised original length. Empty application packets have one empty
-fragment. Maximum encrypted QUIC DATAGRAM payload is 1046 bytes. Quinn handles
-outer UDP packet sizes/PMTU; this layer does not rely on IP fragmentation.
+On TCP/Noise, UDP uses mux type 4 instead of QUIC DATAGRAM.
 
-Each direction uses independent split keys and a strictly increasing send nonce.
-The receiver authenticates before updating a 1024-packet replay window.
-Reassembly accepts reordering, caps incomplete messages at 128 (about 8.4 MB
-payload maximum), and expires them after 2 seconds. Loss discards the application
-message, never retransmits it. Traffic delayed beyond the replay window is
-dropped as permitted by UDP semantics. Message IDs are never reused within a
-session. All maps and keys are discarded on reconnect.
+Reassembly accepts reordering, caps incomplete messages at 128, and expires them
+after 2 seconds. Loss discards the application message. All maps and keys are
+discarded on reconnect.
 
 ## Bounds and lifecycle
 
-Defaults per connection: 256 TCP streams, 4096 UDP flows, 1 MiB QUIC send/receive
-datagram queues, 32 MiB QUIC connection receive/send windows, 16 MiB stream receive
-windows, and an 8 MiB aggregate client UDP forwarding queue. Each flow queue has
-8 message slots; a full queue drops the new application packet. Server connection
-limit is 128; QUIC Retry validates addresses before session allocation. Deployment
-limits should be reduced for small machines and untrusted public workloads.
-
-The UDP send-key budget is 2^32 encrypted fragments. Exhaustion closes the tunnel
-and triggers fresh authentication rather than wrapping nonces. All sessions also
-expire after 24 hours. This is safe but disruptive renewal, not seamless rekey.
-QUIC TLS key updates remain Quinn's responsibility. All protocol constants and
-limits are versioned with this implementation.
+Defaults per connection: 1024 TCP streams, 4096 UDP flows, 128 MiB QUIC
+connection send/receive windows, 16 MiB stream receive windows, 256 KiB relay
+chunks, and an 8 MiB aggregate client UDP forwarding queue. Server connection
+limit is 128. QUIC Retry validates addresses before session allocation.
+Congestion control is Cubic by default; `transport.quic.congestion = "bbr"`
+selects BBR. Sessions expire after 24 hours.

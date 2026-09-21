@@ -19,3 +19,16 @@ type = "tcp"
 local_addr = "backend:3000"
 nodelay = true
 
+[client.services.tcp_echo]
+type = "tcp"
+local_addr = "backend:3001"
+nodelay = true
+
+[client.services.udp_echo]
+type = "udp"
+local_addr = "backend:3002"
+
+[client.services.https]
+type = "tcp"
+local_addr = "backend:3443"
+nodelay = true

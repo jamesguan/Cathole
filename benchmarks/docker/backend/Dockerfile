@@ -8,5 +8,5 @@ FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 benchmark
 COPY --from=builder /build/target/release/cathole-benchmark-backend /usr/local/bin/backend
 USER 10001
-EXPOSE 3000
+EXPOSE 3000 3001 3002/udp 3443
 ENTRYPOINT ["/usr/local/bin/backend"]

@@ -28,3 +28,16 @@ type = "tcp"
 bind_addr = "0.0.0.0:8080"
 nodelay = true
 
+[server.services.tcp_echo]
+type = "tcp"
+bind_addr = "0.0.0.0:8081"
+nodelay = true
+
+[server.services.udp_echo]
+type = "udp"
+bind_addr = "0.0.0.0:8082"
+
+[server.services.https]
+type = "tcp"
+bind_addr = "0.0.0.0:8443"
+nodelay = true
