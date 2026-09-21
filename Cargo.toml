@@ -3,11 +3,12 @@ name = "cathole"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Reverse proxy with Noise-protected payloads over QUIC/UDP"
+description = "Reverse proxy with QUIC or TCP+Noise tunnels, inspired by Rathole"
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log", "bloom"] }
 rcgen = "0.14"
@@ -17,7 +18,8 @@ serde_json = "1"
 snow = { version = "0.10", features = ["ring-accelerated"] }
 socket2 = "0.6"
 subtle = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -26,3 +28,34 @@ rand = "0.9"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+large_futures = "warn"
+large_stack_frames = "warn"
+rc_buffer = "deny"
+rc_mutex = "deny"
+mutex_integer = "deny"
+redundant_clone = "deny"
+useless_vec = "deny"
+implicit_clone = "deny"
+cloned_instead_of_copied = "deny"
+inefficient_to_string = "deny"
+slow_vector_initialization = "deny"
+or_fun_call = "deny"
+expect_fun_call = "deny"
+trivial_regex = "deny"
+unused_async = "deny"
+fn_to_numeric_cast_any = "deny"
+mutex_atomic = "deny"

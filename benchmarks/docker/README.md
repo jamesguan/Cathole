@@ -8,7 +8,10 @@ This harness compares five paths to one multi-threaded Axum backend:
    listener to the WireGuard peer.
 4. FRP v0.71.0 using TCP multiplexing, TLS, wire protocol v2, and per-proxy
    encryption without compression.
-5. The Cathole workspace build using Noise NK over QUIC/UDP.
+5. The Cathole workspace build using Noise NK over a multiplexed TCP tunnel
+   (`transport.type = "noise"`), matching Rathole's transport for a fair local
+   comparison. Set `type = "quic"` in the Cathole configs to measure QUIC/UDP
+   instead.
 
 The topology uses three isolated Docker networks. The benchmark container can
 reach only the public-side containers and the direct backend. Tunnel clients can

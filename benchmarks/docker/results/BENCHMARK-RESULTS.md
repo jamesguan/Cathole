@@ -1,6 +1,6 @@
 # Docker comparison benchmark results
 
-Run at: 2026-09-21T04:25:29Z
+Run at: 2026-09-21T05:43:52Z
 
 Stacks were started and measured **one target at a time**. Other reverse-proxy and VPN containers were stopped during each run so CPU, sockets, and the Docker bridge were not shared.
 
@@ -9,9 +9,9 @@ Stacks were started and measured **one target at a time**. Other reverse-proxy a
 | Rank | Target | Score | Throughput | Request rate | Latency | Reliability | Correctness |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | 1 | direct | 5 | #1 | #1 | #1 | #1 | PASS |
-| 2 | rathole | 3.75 | #2 | #2 | #2 | #3 | PASS |
-| 3 | wireguard | 2.55 | #5 | #3 | #3 | #2 | PASS |
-| 4 | cathole | 2.34 | #3 | #4 | #4 | #4 | PASS |
+| 2 | rathole | 4 | #2 | #2 | #2 | #2 | PASS |
+| 3 | cathole | 2.34 | #3 | #4 | #4 | #4 | PASS |
+| 4 | wireguard | 2.3 | #5 | #3 | #3 | #3 | PASS |
 | 5 | frp | 1.35 | #4 | #5 | #5 | #5 | PASS |
 
 Score weights: saturation throughput 35%, small-response request rate 20%, p50 latency 20%, error rate 25%. A correctness failure ranks last on reliability.
@@ -20,61 +20,61 @@ Score weights: saturation throughput 35%, small-response request rate 20%, p50 l
 
 | Rank | Target | Peak MiB/s | At connections | p50 ms | p99 ms |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | direct | 21767.41 | 1000 | 2.11 | 8.39 |
-| 2 | rathole | 2877.49 | 1000 | 15.79 | 238.31 |
-| 3 | cathole | 268.42 | 256 | 57.79 | 109.69 |
-| 4 | frp | 251.72 | 64 | 16.69 | 19.55 |
-| 5 | wireguard | 55.85 | 256 | 274.68 | 884.05 |
+| 1 | direct | 20427.29 | 1000 | 2.15 | 8.82 |
+| 2 | rathole | 2582.68 | 1000 | 17.07 | 211.75 |
+| 3 | cathole | 577.07 | 256 | 27.27 | 35.5 |
+| 4 | frp | 245.63 | 256 | 63.19 | 199.91 |
+| 5 | wireguard | 53.01 | 1000 | 739.21 | 5446.71 |
 
 ## Speed: small-response request rate
 
 | Rank | Target | Latency RPS | p50 ms | p99 ms | Stress RPS |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | direct | 333729 | 0.17 | 0.46 | 907892 |
-| 2 | rathole | 105698 | 0.61 | 1.09 | 200713 |
-| 3 | wireguard | 39729 | 1.58 | 2.17 | 44256 |
-| 4 | cathole | 17239 | 3.43 | 10.31 | 40363 |
-| 5 | frp | 9479 | 6.73 | 8.48 | 9571 |
+| 1 | direct | 353092 | 0.16 | 0.41 | 827651 |
+| 2 | rathole | 100766 | 0.61 | 1.25 | 196391 |
+| 3 | wireguard | 40978 | 1.56 | 2.18 | 45942 |
+| 4 | cathole | 18124 | 3.47 | 5.92 | 18286 |
+| 5 | frp | 9782 | 6.62 | 8.33 | 8984 |
 
 ## Reliability
 
 | Rank | Target | Correctness | Error rate | Timeouts | Connect | Read | Write | Status |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | direct | PASS | 0% | 982 | 0 | 0 | 0 | 0 |
-| 2 | wireguard | PASS | 0.02% | 220 | 0 | 0 | 0 | 0 |
-| 3 | rathole | PASS | 0.02% | 1044 | 0 | 0 | 0 | 0 |
-| 4 | cathole | PASS | 0.1% | 698 | 0 | 0 | 0 | 0 |
-| 5 | frp | PASS | 0.14% | 425 | 0 | 0 | 0 | 0 |
+| 1 | direct | PASS | 0% | 674 | 0 | 0 | 0 | 0 |
+| 2 | rathole | PASS | 0% | 256 | 0 | 0 | 0 | 0 |
+| 3 | wireguard | PASS | 0% | 67 | 0 | 0 | 0 | 0 |
+| 4 | cathole | PASS | 0.01% | 64 | 0 | 0 | 0 | 0 |
+| 5 | frp | PASS | 0.02% | 64 | 0 | 0 | 0 | 0 |
 
 ## wrk results
 
 | Test | Target | Connections | Requests/s | Transfer MiB/s | p50 ms | p95 ms | p99 ms | Errors |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| latency | cathole | 64 | 17239 | 2.35 | 3.43 | 7.49 | 10.31 | 0 |
-| latency | direct | 64 | 333729 | 45.51 | 0.17 | 0.31 | 0.46 | 0 |
-| latency | frp | 64 | 9479 | 1.29 | 6.73 | 7.86 | 8.48 | 0 |
-| latency | rathole | 64 | 105698 | 14.41 | 0.61 | 0.9 | 1.09 | 61 |
-| latency | wireguard | 64 | 39729 | 5.41 | 1.58 | 1.86 | 2.17 | 0 |
-| saturation | cathole | 64 | 3831 | 240.05 | 17.38 | 27.19 | 32.02 | 64 |
-| saturation | cathole | 256 | 4277 | 268.42 | 57.79 | 90.32 | 109.69 | 0 |
-| saturation | cathole | 1000 | 3919 | 249.29 | 249.98 | 332.84 | 381.75 | 0 |
-| saturation | direct | 64 | 245974 | 15407.15 | 0.23 | 0.55 | 0.83 | 62 |
-| saturation | direct | 256 | 313260 | 19621.78 | 0.64 | 1.53 | 2.22 | 0 |
-| saturation | direct | 1000 | 347515 | 21767.41 | 2.11 | 5.94 | 8.39 | 920 |
-| saturation | frp | 64 | 4014 | 251.72 | 16.69 | 18.4 | 19.55 | 64 |
-| saturation | frp | 256 | 3947 | 248.07 | 62.55 | 69.71 | 205.36 | 0 |
-| saturation | frp | 1000 | 3446 | 219.07 | 251.28 | 812.41 | 1462.03 | 0 |
-| saturation | rathole | 64 | 2077 | 130.51 | 43.86 | 48.06 | 48.33 | 0 |
-| saturation | rathole | 256 | 9779 | 614.05 | 42.42 | 48.04 | 48.72 | 0 |
-| saturation | rathole | 1000 | 45871 | 2877.49 | 15.79 | 59.71 | 238.31 | 983 |
-| saturation | wireguard | 64 | 832 | 52.24 | 62.4 | 137.97 | 446.46 | 0 |
-| saturation | wireguard | 256 | 879 | 55.85 | 274.68 | 594.59 | 884.05 | 220 |
-| saturation | wireguard | 1000 | 791 | 52.53 | 725.75 | 2899.55 | 5088.85 | 0 |
-| stress | cathole | 1000 | 40363 | 5.5 | 23.43 | 42.44 | 53.06 | 634 |
-| stress | direct | 1000 | 907892 | 123.81 | 0.81 | 2.78 | 4.42 | 0 |
-| stress | frp | 1000 | 9571 | 1.3 | 39.89 | 1116.55 | 5647.65 | 361 |
-| stress | rathole | 1000 | 200713 | 27.37 | 4.64 | 7.97 | 52.25 | 0 |
-| stress | wireguard | 1000 | 44256 | 6.03 | 22.18 | 26.05 | 27.51 | 0 |
+| latency | cathole | 64 | 18124 | 2.47 | 3.47 | 5.21 | 5.92 | 0 |
+| latency | direct | 64 | 353092 | 48.15 | 0.16 | 0.29 | 0.41 | 62 |
+| latency | frp | 64 | 9782 | 1.33 | 6.62 | 7.72 | 8.33 | 64 |
+| latency | rathole | 64 | 100766 | 13.74 | 0.61 | 0.91 | 1.25 | 0 |
+| latency | wireguard | 64 | 40978 | 5.58 | 1.56 | 1.82 | 2.18 | 64 |
+| saturation | cathole | 64 | 8281 | 518.72 | 7.71 | 10.01 | 11.63 | 64 |
+| saturation | cathole | 256 | 9212 | 577.07 | 27.27 | 32.2 | 35.5 | 0 |
+| saturation | cathole | 1000 | 9094 | 570.67 | 108.43 | 116.05 | 939.62 | 0 |
+| saturation | direct | 64 | 235090 | 14725.45 | 0.23 | 0.52 | 0.8 | 0 |
+| saturation | direct | 256 | 302314 | 18936.16 | 0.66 | 1.64 | 2.46 | 0 |
+| saturation | direct | 1000 | 326120 | 20427.29 | 2.15 | 6.2 | 8.82 | 612 |
+| saturation | frp | 64 | 3883 | 243.44 | 16.31 | 18.12 | 19.32 | 0 |
+| saturation | frp | 256 | 3906 | 245.63 | 63.19 | 70.29 | 199.91 | 0 |
+| saturation | frp | 1000 | 3581 | 227.64 | 245.88 | 817.64 | 1463.11 | 0 |
+| saturation | rathole | 64 | 2095 | 131.61 | 43.82 | 48.05 | 48.3 | 0 |
+| saturation | rathole | 256 | 9990 | 627.28 | 42.39 | 48.03 | 48.88 | 256 |
+| saturation | rathole | 1000 | 41176 | 2582.68 | 17.07 | 60.56 | 211.75 | 0 |
+| saturation | wireguard | 64 | 834 | 52.33 | 64.43 | 131.74 | 437.27 | 0 |
+| saturation | wireguard | 256 | 829 | 52.71 | 271.57 | 586.93 | 863.61 | 3 |
+| saturation | wireguard | 1000 | 796 | 53.01 | 739.21 | 3127.86 | 5446.71 | 0 |
+| stress | cathole | 1000 | 18286 | 2.49 | 53.78 | 58.8 | 589.83 | 0 |
+| stress | direct | 1000 | 827651 | 112.87 | 0.88 | 3.25 | 5.46 | 0 |
+| stress | frp | 1000 | 8984 | 1.22 | 42.13 | 2095.86 | 5916.1 | 0 |
+| stress | rathole | 1000 | 196391 | 26.78 | 4.74 | 8.25 | 66.28 | 0 |
+| stress | wireguard | 1000 | 45942 | 6.26 | 21.4 | 24.52 | 26.5 | 0 |
 
 ## Emby-style 10 GiB stream
 
@@ -82,19 +82,19 @@ One HTTP/1.1 GET of a generated 10 GiB `video/mp4` body on a single connection, 
 
 | Rank | Target | MiB/s | Seconds | TTFB s | Complete |
 | ---: | --- | ---: | ---: | ---: | --- |
-| 1 | direct | 4762.79 | 2.15 | 0 | PASS |
-| 2 | rathole | 284.99 | 35.93 | 0 | PASS |
-| 3 | cathole | 218.7 | 46.82 | 0 | PASS |
-| 4 | frp | 184.93 | 55.37 | 0 | PASS |
-| 5 | wireguard | 54.17 | 189.01 | 0 | PASS |
+| 1 | direct | 4452.17 | 2.29 | 0 | PASS |
+| 2 | cathole | 853.33 | 12 | 0 | PASS |
+| 3 | rathole | 261.49 | 39.15 | 0 | PASS |
+| 4 | frp | 185.77 | 55.12 | 0 | PASS |
+| 5 | wireguard | 54.01 | 189.57 | 0 | PASS |
 
 | Target | Seek (16 x 8 MiB Range) | Seek MiB/s |
 | --- | --- | ---: |
-| direct | PASS | 711.11 |
-| rathole | PASS | 152.38 |
-| wireguard | PASS | 50.59 |
-| cathole | PASS | 182.85 |
-| frp | PASS | 158.02 |
+| direct | PASS | 673.68 |
+| rathole | PASS | 150.58 |
+| cathole | PASS | 474.07 |
+| wireguard | PASS | 52.24 |
+| frp | PASS | 156.09 |
 
 Correctness performs 30 requests per target and verifies the hello response plus exact 64 KiB and 1 MiB bodies. Stream tests also check `/video` Content-Length and one Range response.
 

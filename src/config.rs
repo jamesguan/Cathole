@@ -64,7 +64,7 @@ impl Default for Transport {
     }
 }
 
-/// Parsed for migration compatibility. Cathole never uses TCP as its tunnel.
+/// TCP socket options for forwarded connections and for `transport.type = "tcp"|"tls"` tunnels.
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TcpCompat {
@@ -133,6 +133,11 @@ pub struct Quic {
     pub receive_window: u32,
     pub send_window: u32,
     pub socket_buffer: usize,
+    #[serde(default = "congestion_cubic")]
+    pub congestion: String,
+}
+fn congestion_cubic() -> String {
+    "cubic".into()
 }
 impl Default for Quic {
     fn default() -> Self {
@@ -145,12 +150,13 @@ impl Default for Quic {
             max_idle_timeout: 60,
             udp_idle_timeout: 60,
             max_connections: 128,
-            max_streams: 256,
+            max_streams: 1024,
             max_udp_flows: 4096,
             stream_receive_window: 16 * 1024 * 1024,
-            receive_window: 32 * 1024 * 1024,
-            send_window: 32 * 1024 * 1024,
+            receive_window: 128 * 1024 * 1024,
+            send_window: 128 * 1024 * 1024,
             socket_buffer: 4 * 1024 * 1024,
+            congestion: congestion_cubic(),
         }
     }
 }
@@ -191,6 +197,27 @@ impl Side {
     pub fn service_retry(&self, service: &Service) -> u64 {
         service.retry_interval.unwrap_or(self.retry_interval)
     }
+    pub fn tcp_tunnel(&self) -> bool {
+        matches!(self.transport.kind.as_str(), "tcp" | "tls" | "noise")
+    }
+
+    pub fn tls_hostname(&self) -> &str {
+        self.transport
+            .tls
+            .as_ref()
+            .and_then(|t| t.hostname.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.transport.quic.hostname.as_str())
+    }
+
+    pub fn tls_trusted_root(&self) -> Option<&str> {
+        self.transport.quic.trusted_root.as_deref().or_else(|| {
+            self.transport
+                .tls
+                .as_ref()
+                .and_then(|t| t.trusted_root.as_deref())
+        })
+    }
 }
 
 pub fn key(value: &Option<String>) -> Result<Vec<u8>> {
@@ -230,7 +257,7 @@ fn validate_noise(noise: &Noise, server: bool, pinned_tls: bool) -> Result<()> {
         }
         Some("XX") => ensure!(
             pinned_tls,
-            "Noise XX requires QUIC certificate authentication"
+            "Noise XX requires pinned TLS certificate authentication"
         ),
         _ => unreachable!(),
     }
@@ -239,13 +266,24 @@ fn validate_noise(noise: &Noise, server: bool, pinned_tls: bool) -> Result<()> {
 
 fn validate_side(s: &mut Side, server: bool) -> Result<()> {
     ensure!(
-        matches!(s.transport.kind.as_str(), "noise" | "quic"),
-        "Cathole always transports over QUIC/UDP; use transport.type = noise or quic"
+        matches!(s.transport.kind.as_str(), "noise" | "quic" | "tcp" | "tls"),
+        "transport.type must be quic, noise, tcp, or tls (websocket is unsupported)"
     );
     ensure!(
         s.transport.tcp.proxy.is_none(),
-        "HTTP/SOCKS TCP proxy settings cannot carry the UDP tunnel"
+        "HTTP/SOCKS TCP proxies cannot carry the tunnel"
     );
+    if let Some(tls) = &s.transport.tls {
+        ensure!(
+            tls.pkcs12.is_none() && tls.pkcs12_password.is_none(),
+            "PKCS#12 is unsupported; use DER certificate and private_key in [transport.quic]"
+        );
+    }
+    ensure!(
+        matches!(s.transport.quic.congestion.as_str(), "cubic" | "bbr"),
+        "transport.quic.congestion must be cubic or bbr"
+    );
+    let client_tls_root = s.tls_trusted_root().map(str::to_owned);
     let q = &mut s.transport.quic;
     if !server {
         q.max_idle_timeout = s.heartbeat_timeout;
@@ -268,7 +306,7 @@ fn validate_side(s: &mut Side, server: bool) -> Result<()> {
     );
     ensure!(
         (1..=4096).contains(&q.max_connections)
-            && (1..=4096).contains(&q.max_streams)
+            && (1..=8192).contains(&q.max_streams)
             && (1..=65536).contains(&q.max_udp_flows),
         "resource limits out of range"
     );
@@ -283,18 +321,30 @@ fn validate_side(s: &mut Side, server: bool) -> Result<()> {
         );
         ensure!(
             q.certificate.is_some() == q.private_key.is_some(),
-            "provide both QUIC certificate and private_key, or neither in Noise mode"
+            "provide both certificate and private_key, or neither"
         );
+        if s.transport.kind == "tls" {
+            ensure!(
+                q.certificate.is_some() && q.private_key.is_some(),
+                "type=tls requires [transport.quic] certificate and private_key"
+            );
+        }
     } else {
         ensure!(
             s.remote_addr.is_some() && s.bind_addr.is_none(),
             "client requires remote_addr only"
         );
+        if s.transport.kind == "tls" {
+            ensure!(
+                client_tls_root.is_some(),
+                "type=tls requires trusted_root on the client"
+            );
+        }
     }
     let pinned_tls = if server {
         q.certificate.is_some()
     } else {
-        q.trusted_root.is_some()
+        client_tls_root.is_some()
     };
     validate_noise(&s.transport.noise, server, pinned_tls)?;
     ensure!(s.retry_interval <= 86400, "retry_interval out of range");
@@ -343,7 +393,7 @@ impl Config {
     }
     pub fn read(path: &Path) -> Result<Self> {
         let mut c = Self::parse(&std::fs::read_to_string(path)?)?;
-        let dir = path.parent().unwrap_or(Path::new("."));
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
         for side in c.server.iter_mut().chain(c.client.iter_mut()) {
             let q = &mut side.transport.quic;
             for p in [&mut q.certificate, &mut q.private_key, &mut q.trusted_root]
@@ -351,8 +401,14 @@ impl Config {
                 .flatten()
             {
                 if Path::new(p).is_relative() {
-                    *p = dir.join(&p).to_string_lossy().into_owned();
+                    *p = dir.join(&*p).to_string_lossy().into_owned();
                 }
+            }
+            if let Some(tls) = side.transport.tls.as_mut()
+                && let Some(p) = tls.trusted_root.as_mut()
+                && Path::new(p).is_relative()
+            {
+                *p = dir.join(&*p).to_string_lossy().into_owned();
             }
         }
         Ok(c)
@@ -399,6 +455,7 @@ retry_interval = 3
         assert_eq!(c.token(s), "test-secret");
         assert_eq!(c.service_retry(s), 3);
         assert_eq!(c.transport.quic.max_idle_timeout, 40);
+        assert!(c.tcp_tunnel());
 
         let text = sample().replace(
             "[client.transport.noise]",
@@ -408,8 +465,12 @@ retry_interval = 3
         assert!(!c.nodelay(&c.services["minecraft"]));
     }
     #[test]
-    fn rejects_unsupported_transport_and_proxy() {
-        assert!(Config::parse(&sample().replace("type = \"noise\"", "type = \"tcp\"")).is_err());
+    fn accepts_tcp_tunnel_and_rejects_proxy_and_websocket() {
+        let tcp = Config::parse(&sample().replace("type = \"noise\"", "type = \"tcp\"")).unwrap();
+        assert!(tcp.client.unwrap().tcp_tunnel());
+        assert!(
+            Config::parse(&sample().replace("type = \"noise\"", "type = \"websocket\"")).is_err()
+        );
         assert!(
             Config::parse(&sample().replace(
                 "[client.transport.noise]",

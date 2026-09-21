@@ -1,8 +1,12 @@
-use crate::config::Quic;
-use anyhow::Result;
+use crate::{config::Quic, crypto};
+use anyhow::{Context, Result};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+fn alpn() -> Vec<Vec<u8>> {
+    vec![crypto::PROTO.to_vec()]
+}
 
 fn transport(q: &Quic) -> Result<Arc<TransportConfig>> {
     let mut t = TransportConfig::default();
@@ -19,9 +23,17 @@ fn transport(q: &Quic) -> Result<Arc<TransportConfig>> {
     t.stream_receive_window(q.stream_receive_window.into());
     t.receive_window(q.receive_window.into());
     t.send_window(q.send_window.into());
-    t.datagram_receive_buffer_size(Some(1024 * 1024));
-    t.datagram_send_buffer_size(1024 * 1024);
-    // Quinn's paced congestion control and DPLPMTUD remain enabled.
+    t.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+    t.datagram_send_buffer_size(4 * 1024 * 1024);
+    t.enable_segmentation_offload(true);
+    match q.congestion.as_str() {
+        "bbr" => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        _ => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+    }
     Ok(Arc::new(t))
 }
 
@@ -66,7 +78,7 @@ pub fn server(addr: SocketAddr, q: &Quic) -> Result<Endpoint> {
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key.into())?;
-    tls.alpn_protocols = vec![b"cathole/1".to_vec()];
+    tls.alpn_protocols = alpn();
     let mut config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
     ));
@@ -93,7 +105,7 @@ pub fn client(addr: SocketAddr, q: &Quic) -> Result<Endpoint> {
             .with_custom_certificate_verifier(NoiseAuthenticatedOuterTls::new())
             .with_no_client_auth()
     };
-    tls.alpn_protocols = vec![b"cathole/1".to_vec()];
+    tls.alpn_protocols = alpn();
     let mut cfg = ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
         tls,
     )?));
@@ -158,4 +170,32 @@ impl rustls::client::danger::ServerCertVerifier for NoiseAuthenticatedOuterTls {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
+}
+
+pub fn rustls_server(q: &Quic) -> Result<rustls::ServerConfig> {
+    let cert = CertificateDer::from(std::fs::read(
+        q.certificate
+            .as_ref()
+            .context("type=tls requires certificate")?,
+    )?);
+    let key = PrivatePkcs8KeyDer::from(std::fs::read(
+        q.private_key
+            .as_ref()
+            .context("type=tls requires private_key")?,
+    )?);
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key.into())?;
+    tls.alpn_protocols = alpn();
+    Ok(tls)
+}
+
+pub fn rustls_client(trusted_root: &str) -> Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(std::fs::read(trusted_root)?))?;
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = alpn();
+    Ok(tls)
 }

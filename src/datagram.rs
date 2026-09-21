@@ -1,27 +1,28 @@
-use crate::crypto::DatagramCrypto;
 use anyhow::{Result, ensure};
 use quinn::Connection;
 use std::{
     collections::HashMap,
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
-// Fixed-size fragments fit the QUIC minimum path size with encryption overhead.
-// No IP fragmentation or reliable stream fallback is used.
+// Fixed-size fragments fit the QUIC DATAGRAM budget. QUIC packet protection
+// encrypts them; there is no second application AEAD on this path.
 pub const CHUNK: usize = 1000;
 pub const MAX_PAYLOAD: usize = 65507;
 const HEADER: usize = 22;
 const MAX_ASSEMBLIES: usize = 128;
 
 pub struct Sender {
-    pub crypto: Mutex<DatagramCrypto>,
     next_message: std::sync::atomic::AtomicU64,
 }
+impl Default for Sender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Sender {
-    pub fn new(crypto: DatagramCrypto) -> Self {
+    pub fn new() -> Self {
         Self {
-            crypto: Mutex::new(crypto),
             next_message: 0.into(),
         }
     }
@@ -38,17 +39,14 @@ impl Sender {
         for i in 0..payload.len().div_ceil(CHUNK).max(1) {
             let start = i * CHUNK;
             let end = (start + CHUNK).min(payload.len());
-            let mut p = Vec::with_capacity(HEADER + end - start);
+            let mut p = crate::buf::take_buf(HEADER + end - start);
             p.extend_from_slice(&service.to_be_bytes());
             p.extend_from_slice(&flow.to_be_bytes());
             p.extend_from_slice(&message.to_be_bytes());
             p.extend_from_slice(&(payload.len() as u16).to_be_bytes());
             p.extend_from_slice(&(i as u16).to_be_bytes());
             p.extend_from_slice(&payload[start..end]);
-            let encrypted = self.crypto.lock().unwrap().seal(&p).inspect_err(|_| {
-                conn.close(1u32.into(), b"Noise key renewal required");
-            })?;
-            conn.send_datagram(encrypted.into())?;
+            conn.send_datagram(p.freeze())?;
         }
         Ok(())
     }
@@ -93,7 +91,11 @@ impl Reassembler {
             return Ok(Some(Packet {
                 service,
                 flow,
-                payload: p[HEADER..].to_vec(),
+                payload: {
+                    let mut out = crate::buf::take_vec(p.len() - HEADER);
+                    out.extend_from_slice(&p[HEADER..]);
+                    out
+                },
             }));
         }
         self.expire(now);
@@ -111,7 +113,11 @@ impl Reassembler {
             a.service == service && a.flow == flow && a.length == length,
             "inconsistent fragments"
         );
-        a.parts[index] = Some(p[HEADER..].to_vec());
+        a.parts[index] = Some({
+            let mut part = crate::buf::take_vec(p.len() - HEADER);
+            part.extend_from_slice(&p[HEADER..]);
+            part
+        });
         if a.parts.iter().any(Option::is_none) {
             return Ok(None);
         }

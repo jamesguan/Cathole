@@ -55,7 +55,7 @@ async fn connect(cfg: Arc<Side>) -> Result<()> {
 async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
     let session = tokio::time::timeout(SETUP, async {
         let reg = Registration {
-            version: 1,
+            version: REGISTRATION_VERSION,
             services: cfg
                 .services
                 .iter()
@@ -67,16 +67,14 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
                 .collect(),
         };
         let (mut send, mut recv) = conn.open_bi().await?;
-        let (data_crypto, reply) = crypto::initiate_datagram(
+        crypto::initiate_session(
             &conn,
             &cfg.transport.noise,
             &mut send,
             &mut recv,
-            b"registration",
             &serde_json::to_vec(&reg)?,
         )
         .await?;
-        ensure!(reply == b"ok", "service registration rejected");
         send.finish()?;
         ensure!(
             crypto::read_frame(&mut recv).await?.is_none(),
@@ -84,7 +82,7 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
         );
         Ok::<_, anyhow::Error>(Arc::new(Session {
             conn: conn.clone(),
-            data: Arc::new(datagram::Sender::new(data_crypto)),
+            data: Arc::new(datagram::Sender::new()),
         }))
     })
     .await??;
@@ -117,11 +115,12 @@ async fn session(conn: Connection, cfg: Arc<Side>) -> Result<()> {
             _ = tick.tick() => assembly.expire(std::time::Instant::now()),
             incoming = conn.accept_bi() => {
                 let (send, recv) = incoming?;
-                let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
-                let conn = conn.clone(); let cfg = cfg.clone();
+                let conn_cfg = cfg.clone();
+                let slots = slots.clone();
                 streams.spawn(async move {
+                    let Ok(permit) = slots.acquire_owned().await else { return; };
                     let _permit = permit;
-                    if let Err(e) = tcp_client(conn, cfg, send, recv).await { tracing::debug!(error = %e, "TCP forwarding ended"); }
+                    if let Err(e) = tcp_client(conn_cfg, send, recv).await { tracing::debug!(error = %e, "TCP forwarding ended"); }
                 });
             },
             packet = read_packet(&session, &mut assembly) => {

@@ -197,9 +197,12 @@ identity = work / "identity"
 subprocess.run([binary, "--init", str(identity)], check=True, stdout=subprocess.DEVNULL)
 server_file, client_file = identity / "server.toml", identity / "client.toml"
 server_port, public_port = free_port(), free_port()
-relay = Relay(server_port)
+if args.legacy_noise and args.pattern == "xx":
+    raise SystemExit("XX requires certificates; do not combine with --legacy-noise")
+relay = None if args.legacy_noise else Relay(server_port)
 server_text = server_file.read_text().replace("127.0.0.1:2333", address(server_port)).replace("127.0.0.1:5202", address(public_port)).replace("keep_alive_interval = 15", "keep_alive_interval = 2").replace("max_idle_timeout = 60", "max_idle_timeout = 8")
-client_text = client_file.read_text().replace("127.0.0.1:2333", address(relay.front.getsockname()[1])).replace("keep_alive_interval = 15", "keep_alive_interval = 2").replace("max_idle_timeout = 60", "max_idle_timeout = 8")
+client_remote = address(server_port) if args.legacy_noise else address(relay.front.getsockname()[1])
+client_text = client_file.read_text().replace("127.0.0.1:2333", client_remote).replace("keep_alive_interval = 15", "keep_alive_interval = 2").replace("max_idle_timeout = 60", "max_idle_timeout = 8")
 local_host = "[::]" if args.ipv6 else "0.0.0.0"
 client_text = client_text.replace('local_addr = "127.0.0.1:5201"', f'local_addr = "{local_host}:{tcp_echo.getsockname()[1]}"', 1)
 client_text = client_text.replace('local_addr = "127.0.0.1:5201"', f'local_addr = "{local_host}:{udp_echo.getsockname()[1]}"')
@@ -263,16 +266,16 @@ try:
         terminate(bad)
     client = launch(client_file)
     ready(public_port)
-    # Complete one stream before migration so the QUIC peer has time to issue
-    # post-handshake connection IDs. Rebinding immediately after registration
-    # races that protocol exchange on fast loopback runs.
-    tcp_roundtrip(public_port, b"before NAT port rebinding")
-    relay.rebind_requested = True
-    # With a compatibility config that omits transport.quic, the default client
-    # keepalive is 15 seconds. That outbound packet is what reveals a changed NAT
-    # mapping when no application traffic is flowing from client to server.
-    time.sleep(16 if args.legacy_noise else 0.5)
-    tcp_roundtrip(public_port, b"same session after NAT port rebinding")
+    if args.legacy_noise:
+        tcp_roundtrip(public_port, b"tcp noise tunnel")
+    else:
+        # Complete one stream before migration so the QUIC peer has time to issue
+        # post-handshake connection IDs. Rebinding immediately after registration
+        # races that protocol exchange on fast loopback runs.
+        tcp_roundtrip(public_port, b"before NAT port rebinding")
+        relay.rebind_requested = True
+        time.sleep(0.5)
+        tcp_roundtrip(public_port, b"same session after NAT port rebinding")
     tcp_roundtrip(public_port, os.urandom(2 * 1024 * 1024))
     with concurrent.futures.ThreadPoolExecutor(max_workers=24) as pool:
         list(pool.map(lambda i: tcp_roundtrip(public_port, bytes([i]) * 32768), range(24)))
@@ -312,7 +315,11 @@ try:
     else:
         probe.close()
         raise AssertionError("removed service remains exposed")
-    print(json.dumps({"result": "PASS", "loss": args.loss, "ipv6": args.ipv6, "seconds": round(time.monotonic()-started, 2), "relay_dropped": relay.dropped, "udp_sizes_delivered": udp_delivered, "checks": ["bulk TCP integrity", "TCP half-close", "24 concurrent streams", "UDP boundaries/fragmentation/empty packets", "UDP source isolation", "wrong token/Noise key/TLS root", "NAT port rebinding", "invalid reload", "reconnect", "hot add/remove"]}))
+    checks = ["bulk TCP integrity", "TCP half-close", "24 concurrent streams", "UDP boundaries/fragmentation/empty packets", "UDP source isolation", "wrong token/Noise key", "invalid reload", "reconnect", "hot add/remove"]
+    if not args.legacy_noise:
+        checks.append("NAT port rebinding")
+        checks.append("TLS root rejection")
+    print(json.dumps({"result": "PASS", "loss": args.loss, "ipv6": args.ipv6, "seconds": round(time.monotonic()-started, 2), "relay_dropped": 0 if relay is None else relay.dropped, "udp_sizes_delivered": udp_delivered, "checks": checks}))
 except BaseException:
     for log in logs:
         log.flush()
@@ -323,7 +330,8 @@ finally:
     for p in processes:
         if p.poll() is None:
             terminate(p)
-    relay.close()
+    if relay is not None:
+        relay.close()
     stop.set()
     for log in logs:
         log.close()
