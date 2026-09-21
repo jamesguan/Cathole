@@ -1,0 +1,159 @@
+name: cathole-benchmark
+
+x-benchmark-ulimits: &benchmark-ulimits
+  nofile:
+    soft: 65535
+    hard: 65535
+
+services:
+  backend:
+    build:
+      context: ./backend
+    networks:
+      - public
+      - private
+    ulimits: *benchmark-ulimits
+
+  rathole-server:
+    image: ghcr.io/rathole-org/rathole@sha256:8cd9ca2d7183b22977f13faa193ec91348dd713bb3db6d8d0fbc60bfc32ca273
+    command: ["--server", "/config/server.toml"]
+    volumes:
+      - ./config/rathole-server.toml:/config/server.toml:ro
+    networks:
+      - public
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  rathole-client:
+    image: ghcr.io/rathole-org/rathole@sha256:8cd9ca2d7183b22977f13faa193ec91348dd713bb3db6d8d0fbc60bfc32ca273
+    command: ["--client", "/config/client.toml"]
+    volumes:
+      - ./config/rathole-client.toml:/config/client.toml:ro
+    depends_on:
+      - backend
+      - rathole-server
+    networks:
+      - private
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  frp-server:
+    image: ghcr.io/fatedier/frps:v0.71.0
+    command: ["-c", "/etc/frp/frps.toml"]
+    volumes:
+      - ./config/frps.toml:/etc/frp/frps.toml:ro
+    networks:
+      - public
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  frp-client:
+    image: ghcr.io/fatedier/frpc:v0.71.0
+    command: ["-c", "/etc/frp/frpc.toml"]
+    volumes:
+      - ./config/frpc.toml:/etc/frp/frpc.toml:ro
+    depends_on:
+      - backend
+      - frp-server
+    networks:
+      - private
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  cathole-server:
+    build:
+      context: ../..
+    command: ["/config/server.toml", "--server"]
+    volumes:
+      - ./config/cathole-server.toml:/config/server.toml:ro
+    networks:
+      - public
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  cathole-client:
+    build:
+      context: ../..
+    command: ["/config/client.toml", "--client"]
+    volumes:
+      - ./config/cathole-client.toml:/config/client.toml:ro
+    depends_on:
+      - backend
+      - cathole-server
+    networks:
+      - private
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  wireguard-server:
+    build:
+      context: ./wireguard
+    environment:
+      ROLE: server
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./wireguard/server.conf:/etc/wireguard/wg0.conf:ro
+    networks:
+      - public
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  wireguard-client:
+    build:
+      context: ./wireguard
+    environment:
+      ROLE: client
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./wireguard/client.conf:/etc/wireguard/wg0.conf:ro
+    depends_on:
+      - backend
+      - wireguard-server
+    networks:
+      - private
+      - tunnel
+    ulimits: *benchmark-ulimits
+
+  benchmark:
+    build:
+      context: ./runner
+    environment:
+      THREADS: ${THREADS:-16}
+      DURATION: ${DURATION:-10}
+      STRESS_DURATION: ${STRESS_DURATION:-10}
+      SAMPLES: ${SAMPLES:-3}
+      SATURATION_STEPS: ${SATURATION_STEPS:-64 256 1000}
+      CATHOLE_REVISION: ${CATHOLE_REVISION:-working-tree}
+      DOCKER_VERSION: ${DOCKER_VERSION:-unknown}
+    volumes:
+      - ./results:/results
+      - ../../README.md:/workspace/README.md
+    depends_on:
+      - backend
+      - rathole-client
+      - frp-client
+      - cathole-client
+      - wireguard-client
+    networks:
+      - public
+    ulimits: *benchmark-ulimits
+    profiles:
+      - benchmark
+
+networks:
+  public:
+    internal: true
+  private:
+    internal: true
+  tunnel:
+    internal: true

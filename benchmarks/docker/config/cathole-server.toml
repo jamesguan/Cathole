@@ -1,0 +1,30 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "docker-benchmark-only-token"
+heartbeat_interval = 10
+
+[server.transport]
+type = "noise"
+
+[server.transport.tcp]
+nodelay = true
+
+[server.transport.noise]
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "cOe5pnc0vLZGqtP4nITDPjFgj5GH4VYRbZfKVeZe7M4="
+
+[server.transport.quic]
+keep_alive_interval = 10
+max_idle_timeout = 20
+max_connections = 16
+max_streams = 4096
+stream_receive_window = 67108864
+receive_window = 268435456
+send_window = 268435456
+socket_buffer = 16777216
+
+[server.services.http]
+type = "tcp"
+bind_addr = "0.0.0.0:8080"
+nodelay = true
+

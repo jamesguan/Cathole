@@ -1,0 +1,15 @@
+[package]
+name = "cathole-benchmark-backend"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = "0.8"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

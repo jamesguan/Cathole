@@ -1,0 +1,31 @@
+[client]
+remote_addr = "cathole-server:2333"
+default_token = "docker-benchmark-only-token"
+heartbeat_timeout = 20
+retry_interval = 1
+
+[client.transport]
+type = "noise"
+
+[client.transport.tcp]
+nodelay = true
+
+[client.transport.noise]
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+remote_public_key = "U3nP7JLvTBWEaXdGLMQW78dBG3iDTFCIfIoN8fLzBSI="
+
+[client.transport.quic]
+keep_alive_interval = 10
+max_idle_timeout = 20
+max_streams = 4096
+stream_receive_window = 67108864
+receive_window = 268435456
+send_window = 268435456
+socket_buffer = 16777216
+
+[client.services.http]
+type = "tcp"
+local_addr = "backend:3000"
+nodelay = true
+retry_interval = 1
+

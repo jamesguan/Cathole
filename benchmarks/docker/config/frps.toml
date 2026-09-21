@@ -1,0 +1,12 @@
+bindAddr = "0.0.0.0"
+bindPort = 7000
+auth.method = "token"
+auth.token = "docker-benchmark-only-token"
+transport.tcpMux = true
+transport.maxPoolCount = 16
+transport.tls.force = true
+log.to = "console"
+log.level = "warn"
+allowPorts = [
+  { start = 8080, end = 8080 }
+]
