@@ -1,0 +1,113 @@
+{
+  "environment": "local Windows/loopback; direct and Cathole echo endpoints",
+  "results": [
+    {
+      "target": "direct",
+      "address": [
+        "127.0.0.1",
+        50623
+      ],
+      "parallel": 1,
+      "mib_per_stream": 32,
+      "tcp_mbit_s_echo": 1381.8786535014326,
+      "tcp_rtt_ms_p50": 0.02414998016320169,
+      "tcp_rtt_ms_p95": 0.056200020480901,
+      "tcp_rtt_ms_p99": 0.07999996887519956,
+      "udp_sent": 100,
+      "udp_received": 100,
+      "udp_loss_fraction": 0.0,
+      "udp_rtt_ms_p50": 0.14729995746165514,
+      "udp_rtt_ms_p99": 0.23549998877570033
+    },
+    {
+      "target": "cathole",
+      "address": [
+        "127.0.0.1",
+        50624
+      ],
+      "parallel": 1,
+      "mib_per_stream": 32,
+      "tcp_mbit_s_echo": 515.0389269506871,
+      "tcp_rtt_ms_p50": 0.2006499853450805,
+      "tcp_rtt_ms_p95": 0.27030002092942595,
+      "tcp_rtt_ms_p99": 0.30020001577213407,
+      "udp_sent": 100,
+      "udp_received": 100,
+      "udp_loss_fraction": 0.0,
+      "udp_rtt_ms_p50": 0.31969998963177204,
+      "udp_rtt_ms_p99": 0.5581000004895031
+    },
+    {
+      "target": "direct",
+      "address": [
+        "127.0.0.1",
+        50623
+      ],
+      "parallel": 4,
+      "mib_per_stream": 32,
+      "tcp_mbit_s_echo": 8235.100579845486,
+      "tcp_rtt_ms_p50": 0.028550013666972518,
+      "tcp_rtt_ms_p95": 0.06299995584413409,
+      "tcp_rtt_ms_p99": 0.06539997411891818,
+      "udp_sent": 100,
+      "udp_received": 100,
+      "udp_loss_fraction": 0.0,
+      "udp_rtt_ms_p50": 0.10810000821948051,
+      "udp_rtt_ms_p99": 0.18040003487840295
+    },
+    {
+      "target": "cathole",
+      "address": [
+        "127.0.0.1",
+        50624
+      ],
+      "parallel": 4,
+      "mib_per_stream": 32,
+      "tcp_mbit_s_echo": 1466.6448265968872,
+      "tcp_rtt_ms_p50": 0.1790999958757311,
+      "tcp_rtt_ms_p95": 0.23229996440932155,
+      "tcp_rtt_ms_p99": 0.32900000223889947,
+      "udp_sent": 100,
+      "udp_received": 100,
+      "udp_loss_fraction": 0.0,
+      "udp_rtt_ms_p50": 0.3093000268563628,
+      "udp_rtt_ms_p99": 0.6379000260494649
+    },
+    {
+      "target": "direct",
+      "address": [
+        "127.0.0.1",
+        50623
+      ],
+      "parallel": 16,
+      "mib_per_stream": 32,
+      "tcp_mbit_s_echo": 14965.762450121654,
+      "tcp_rtt_ms_p50": 0.028099981136620045,
+      "tcp_rtt_ms_p95": 0.06120000034570694,
+      "tcp_rtt_ms_p99": 0.07090001599863172,
+      "udp_sent": 100,
+      "udp_received": 100,
+      "udp_loss_fraction": 0.0,
+      "udp_rtt_ms_p50": 0.11799996718764305,
+      "udp_rtt_ms_p99": 0.21920003928244114
+    },
+    {
+      "target": "cathole",
+      "address": [
+        "127.0.0.1",
+        50624
+      ],
+      "parallel": 16,
+      "mib_per_stream": 32,
+      "tcp_mbit_s_echo": 1644.9493889863763,
+      "tcp_rtt_ms_p50": 0.1849000109359622,
+      "tcp_rtt_ms_p95": 0.2937000244855881,
+      "tcp_rtt_ms_p99": 0.3695999621413648,
+      "udp_sent": 100,
+      "udp_received": 100,
+      "udp_loss_fraction": 0.0,
+      "udp_rtt_ms_p50": 0.3097999724559486,
+      "udp_rtt_ms_p99": 0.5201000021770597
+    }
+  ]
+}

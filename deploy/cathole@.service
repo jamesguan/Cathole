@@ -1,0 +1,24 @@
+[Unit]
+Description=Cathole reverse proxy (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cathole
+Group=cathole
+ExecStart=/usr/local/bin/cathole /etc/cathole/%i.toml
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
