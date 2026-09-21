@@ -7,4 +7,5 @@ README are always the newest run.
 | Timestamp (UTC) | Notes |
 | --- | --- |
 | 2026-09-21T05:43:52Z | Cathole **single mux** TCP+Noise. Emby 853 MiB/s; sat peak 577 MiB/s; latency ~18k RPS. Trailed Rathole on multi-conn wrk. |
-| 2026-09-21T06:15:37Z | Cathole **data-channel pool** (per-visitor Noise TCP, UDP on control). Sat peak **3576 MiB/s** (beats Rathole 2583); latency **105k RPS**; Emby **737 MiB/s**; seeks 492 MiB/s. |
+| 2026-09-21T06:15:37Z | Cathole **data-channel pool** (per-visitor Noise TCP, warm 32, try_send CREATE). Sat **3576 MiB/s**; latency **105k RPS**; Emby **737 MiB/s**; reliability #5 (1238 timeouts / 0.02%). |
+| 2026-09-21T16:06:12Z | Warm pool **256** + **awaited CREATE_DATA**. Timeouts **639** (0.01%); sat **3699 MiB/s**; latency **111k RPS**; overall **#2** ahead of Rathole. Stress/sat@1000: 0 timeouts. |

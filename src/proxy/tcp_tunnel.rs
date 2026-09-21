@@ -27,7 +27,81 @@ const HEARTBEAT: u8 = 5;
 const UDP: u8 = 4;
 const CREATE_DATA: u8 = 6;
 const DATA_OPEN: u8 = 0xD0;
-const WARM_POOL: usize = 32;
+/// Idle data channels kept ready per TCP service so wrk connection bursts
+/// do not wait on a Noise handshake for the first request.
+const WARM_POOL: usize = 256;
+
+/// Pairs public visitor sockets with client-opened Noise data channels.
+struct PairingHub {
+    waiting_data: Mutex<HashMap<u16, VecDeque<oneshot::Sender<TcpStream>>>>,
+    waiting_visitors: Mutex<HashMap<u16, VecDeque<TcpStream>>>,
+    /// Reliable create requests; never drop under accept bursts.
+    create: mpsc::UnboundedSender<u16>,
+}
+
+impl PairingHub {
+    fn new(create: mpsc::UnboundedSender<u16>) -> Self {
+        Self {
+            waiting_data: Mutex::new(HashMap::new()),
+            waiting_visitors: Mutex::new(HashMap::new()),
+            create,
+        }
+    }
+
+    fn request_create(&self, service: u16) {
+        let _ = self.create.send(service);
+    }
+
+    fn seed_warm(&self, service: u16) {
+        for _ in 0..WARM_POOL {
+            self.request_create(service);
+        }
+    }
+
+    fn visitor_arrived(&self, service: u16, tcp: TcpStream) {
+        if let Some(tx) = self
+            .waiting_data
+            .lock()
+            .unwrap()
+            .get_mut(&service)
+            .and_then(VecDeque::pop_front)
+        {
+            let _ = tx.send(tcp);
+            // Refill the warm slot that was just consumed.
+            self.request_create(service);
+            return;
+        }
+        self.waiting_visitors
+            .lock()
+            .unwrap()
+            .entry(service)
+            .or_default()
+            .push_back(tcp);
+        // One new data channel for this waiting visitor.
+        self.request_create(service);
+    }
+
+    async fn take_visitor(&self, service: u16) -> Result<TcpStream> {
+        if let Some(tcp) = self
+            .waiting_visitors
+            .lock()
+            .unwrap()
+            .get_mut(&service)
+            .and_then(VecDeque::pop_front)
+        {
+            return Ok(tcp);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.waiting_data
+            .lock()
+            .unwrap()
+            .entry(service)
+            .or_default()
+            .push_back(tx);
+        rx.await
+            .map_err(|_| anyhow::anyhow!("data channel cancelled before visitor arrived"))
+    }
+}
 
 enum Bound {
     Tcp(TcpListener),
@@ -56,65 +130,6 @@ impl Flows {
     fn expire(&mut self, idle: Duration) {
         self.by_id.retain(|_, f| f.touched.elapsed() < idle);
         self.by_peer.retain(|_, id| self.by_id.contains_key(id));
-    }
-}
-
-/// Pairs public visitor sockets with client-opened Noise data channels.
-struct PairingHub {
-    waiting_data: Mutex<HashMap<u16, VecDeque<oneshot::Sender<TcpStream>>>>,
-    waiting_visitors: Mutex<HashMap<u16, VecDeque<TcpStream>>>,
-    create: mpsc::Sender<u16>,
-}
-
-impl PairingHub {
-    fn new(create: mpsc::Sender<u16>) -> Self {
-        Self {
-            waiting_data: Mutex::new(HashMap::new()),
-            waiting_visitors: Mutex::new(HashMap::new()),
-            create,
-        }
-    }
-
-    fn visitor_arrived(&self, service: u16, tcp: TcpStream) {
-        if let Some(tx) = self
-            .waiting_data
-            .lock()
-            .unwrap()
-            .get_mut(&service)
-            .and_then(VecDeque::pop_front)
-        {
-            let _ = tx.send(tcp);
-            let _ = self.create.try_send(service);
-            return;
-        }
-        self.waiting_visitors
-            .lock()
-            .unwrap()
-            .entry(service)
-            .or_default()
-            .push_back(tcp);
-        let _ = self.create.try_send(service);
-    }
-
-    async fn take_visitor(&self, service: u16) -> Result<TcpStream> {
-        if let Some(tcp) = self
-            .waiting_visitors
-            .lock()
-            .unwrap()
-            .get_mut(&service)
-            .and_then(VecDeque::pop_front)
-        {
-            return Ok(tcp);
-        }
-        let (tx, rx) = oneshot::channel();
-        self.waiting_data
-            .lock()
-            .unwrap()
-            .entry(service)
-            .or_default()
-            .push_back(tx);
-        rx.await
-            .map_err(|_| anyhow::anyhow!("data channel cancelled before visitor arrived"))
     }
 }
 
@@ -339,7 +354,7 @@ where
         "client authenticated and services registered"
     );
 
-    let (create_tx, mut create_rx) = mpsc::channel::<u16>(4096);
+    let (create_tx, mut create_rx) = mpsc::unbounded_channel::<u16>();
     let hub = Arc::new(PairingHub::new(create_tx));
     *ACTIVE_HUB.lock().unwrap() = Some(hub.clone());
     let _hub_guard = HubGuard;
@@ -353,13 +368,15 @@ where
         let events = events.clone();
         let cfg = cfg.clone();
         let hub = hub.clone();
+        let sid = id as u16;
         tasks.spawn(async move {
             tracing::info!(service = %name, "service ready");
             match listener {
                 Bound::Tcp(listener) => {
-                    tcp_listen(listener, service, id as u16, cfg, hub, events).await
+                    hub.seed_warm(sid);
+                    tcp_listen(listener, service, sid, cfg, hub, events).await
                 }
-                Bound::Udp(socket) => udp_listen(socket, id as u16, events).await,
+                Bound::Udp(socket) => udp_listen(socket, sid, events).await,
             }
         });
     }
@@ -448,23 +465,6 @@ where
     })
     .await??;
     tracing::info!(services = cfg.services.len(), "tunnel ready");
-
-    let mut service_order: Vec<String> = cfg.services.keys().cloned().collect();
-    service_order.sort();
-    for (id, name) in service_order.iter().enumerate() {
-        let service = &cfg.services[name];
-        if service.kind == Kind::Tcp {
-            for _ in 0..WARM_POOL {
-                let cfg = cfg.clone();
-                let sid = id as u16;
-                tokio::spawn(async move {
-                    if let Err(e) = open_data_channel(cfg, sid).await {
-                        tracing::debug!(error = %e, "warm data channel ended");
-                    }
-                });
-            }
-        }
-    }
 
     let (reader, writer) = tokio::io::split(stream);
     let (tx, rx) = aead.split();
@@ -593,7 +593,7 @@ async fn drive_server<S>(
     send: crypto::AeadSend,
     recv: crypto::AeadRecv,
     mut incoming: mpsc::Receiver<Incoming>,
-    create_rx: &mut mpsc::Receiver<u16>,
+    create_rx: &mut mpsc::UnboundedReceiver<u16>,
     _slots: Arc<Semaphore>,
     mut listeners: JoinSet<Result<()>>,
 ) -> Result<()>
@@ -610,7 +610,8 @@ where
         HashMap::new();
     let queue_bytes = Arc::new(Semaphore::new(8 * 1024 * 1024));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
-    let (out, out_rx) = mpsc::channel::<Bytes>(1024);
+    // Large enough for CREATE bursts under wrk (1000+) without blocking accepts.
+    let (out, out_rx) = mpsc::channel::<Bytes>(8192);
     let (in_tx, mut inbound) = mpsc::channel::<Bytes>(256);
     let mut io = JoinSet::new();
     io.spawn(async move { mux_write(writer, send, out_rx).await });
@@ -626,7 +627,8 @@ where
             Some(service) = create_rx.recv() => {
                 let mut frame = [CREATE_DATA, 0, 0];
                 frame[1..].copy_from_slice(&service.to_be_bytes());
-                let _ = out.try_send(Bytes::copy_from_slice(&frame));
+                // Must await: dropping CREATE under load was the wrk timeout source.
+                out.send(Bytes::copy_from_slice(&frame)).await?;
             },
             _ = tick.tick() => {
                 if cfg.heartbeat_interval > 0 {

@@ -5,16 +5,38 @@ working **experimental implementation**. Both endpoints must run Cathole.
 
 * TCP terminates at each proxy. Over QUIC, each connection is an independent
   bidirectional stream of raw bytes (QUIC TLS encrypts them). Over `tcp`/`noise`,
-  connections are multiplexed on one Noise-encrypted TCP session.
-* UDP uses QUIC DATAGRAM or TCP/Noise mux frames, without application retransmission.
-* Noise NK, KK, or XX authenticates the tunnel **once per session**. QUIC payloads
-  are not Noise-encrypted a second time. TCP tunnels keep Noise AEAD on the mux
-  so the stream is still encrypted.
+  each visitor gets a dedicated Noise-encrypted TCP **data channel** (Rathole-style),
+  while UDP and signaling stay on one control connection.
+* UDP uses QUIC DATAGRAM or control-channel mux frames, without application
+  retransmission.
+* Noise NK, KK, or XX authenticates the tunnel. QUIC payloads are not
+  Noise-encrypted a second time. TCP tunnels keep Noise AEAD on control and data
+  channels so the path is still encrypted.
 * A pinned QUIC/TLS certificate is optional for NK and KK and required for XX.
   Service tokens authorize the client separately for each declared service.
 * Native QUIC pacing, congestion control, flow control, PMTU discovery, keepalive,
   idle detection, and validated NAT rebinding come from Quinn. The process uses a
   multi-thread Tokio runtime (`TOKIO_WORKER_THREADS` overrides the worker count).
+
+### TCP-over-TCP
+
+Cathole is an **application byte-stream** reverse proxy, not a packet tunnel. It
+does **not** encapsulate TCP segments or IP packets inside another TCP (the
+OpenVPN-TCP style failure mode where both stacks retransmit the same loss).
+
+Public and backend TCP connections **terminate** at each proxy. Only application
+bytes cross the middle hop:
+
+`client ↔ proxy` → `encrypted tunnel` → `proxy ↔ backend`
+
+| `transport.type` | Middle hop | Classic TCP-over-TCP meltdown? |
+| --- | --- | --- |
+| `quic` | QUIC over UDP | Avoided; the tunnel is not TCP |
+| `noise` / `tcp` / `tls` | TCP + Noise (per-visitor data channels) | Avoided; byte relay like Rathole/SSH, not nested TCP |
+
+On `noise`/`tcp` you still carry TCP *application* streams over a TCP tunnel
+(same model as Rathole). Use `type = "quic"` when you want the middle hop off
+TCP entirely.
 
 ## Build and run
 
@@ -55,8 +77,9 @@ certificate paths resolve against the config file.
 Cathole uses the familiar `[server]`, `[client]`, and named service layout.
 
 * `transport.type = "quic"` — QUIC/UDP, session Noise auth, QUIC TLS on the data path.
-* `transport.type = "noise"` or `"tcp"` — multiplexed TCP+Noise (Rathole-style).
-* `transport.type = "tls"` — the same mux wrapped in TLS.
+* `transport.type = "noise"` or `"tcp"` — control channel plus per-visitor TCP+Noise
+  data channels (Rathole-style).
+* `transport.type = "tls"` — the same model wrapped in TLS.
 * `websocket` remains unsupported.
 
 Both sides must run Cathole and must declare matching service names, types, and
@@ -446,10 +469,11 @@ network results. Each run writes ranked `BENCHMARK-RESULTS.md` /
 `BENCHMARK-RESULTS.json` at the repository root and replaces the block below.
 
 The tables below are from 2026-09-21. Cathole used multiplexed control plus
-Rathole-style **per-visitor TCP+Noise data channels** (`transport.type = "noise"`).
-Direct, Rathole, WireGuard, and FRP were measured earlier the same day; Cathole
-was re-run after the data-channel pool. Prior mux-only and other runs are
-archived under `benchmarks/docker/results/history/`.
+Rathole-style **per-visitor TCP+Noise data channels** (`transport.type = "noise"`),
+with a **256-slot warm pool** and reliable (awaited) `CREATE_DATA` under accept
+pressure. Direct, Rathole, WireGuard, and FRP were measured earlier the same day;
+Cathole was re-run after the warm-pool fix. Prior runs are archived under
+`benchmarks/docker/results/history/`.
 
 Percent change is `(new − baseline) / baseline`. Positive means Cathole is
 faster. The previous Cathole baseline is the same-day single-mux run
@@ -457,16 +481,17 @@ faster. The previous Cathole baseline is the same-day single-mux run
 
 | Metric | Cathole now | vs Rathole | vs prior Cathole (mux) |
 | --- | ---: | ---: | ---: |
-| Saturation peak (64 KiB wrk) | 3576 MiB/s | **+38%** (2583) | **+520%** (577) |
-| Latency RPS (hello, 64 conn) | 105k | **+4%** (101k) | **+478%** (18k) |
-| Stress RPS (hello, 1000 conn) | 189k | −4% (196k) | **+932%** (18k) |
-| Emby 10 GiB stream | 737 MiB/s | **+182%** (261) | −14% (853) |
+| Saturation peak (64 KiB wrk) | 3699 MiB/s | **+43%** (2583) | **+541%** (577) |
+| Latency RPS (hello, 64 conn) | 111k | **+10%** (101k) | **+511%** (18k) |
+| Stress RPS (hello, 1000 conn) | 186k | −5% (196k) | **+919%** (18k) |
+| Emby 10 GiB stream | 677 MiB/s | **+159%** (261) | −21% (853) |
 | Seek (16×8 MiB Range) | 492 MiB/s | **+227%** (151) | **+4%** (474) |
+| wrk timeouts (all suites) | 639 | — | **−48%** vs data-channel 1238 |
 
 <!-- docker-benchmark-results:start -->
 # Docker comparison benchmark results
 
-Run at: 2026-09-21T06:15:36Z
+Run at: 2026-09-21T16:06:12Z
 
 Stacks were started and measured **one target at a time**. Other reverse-proxy and VPN containers were stopped during each run so CPU, sockets, and the Docker bridge were not shared.
 
@@ -475,10 +500,10 @@ Stacks were started and measured **one target at a time**. Other reverse-proxy a
 | Rank | Target | Score | Throughput | Request rate | Latency | Reliability | Correctness |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | 1 | direct | 5 | #1 | #1 | #1 | #1 | PASS |
-| 2 | rathole | 3.25 | #3 | #3 | #3 | #2 | PASS |
-| 3 | cathole | 3.25 | #2 | #2 | #2 | #5 | PASS |
+| 2 | cathole | 3.5 | #2 | #2 | #2 | #4 | PASS |
+| 3 | rathole | 3.25 | #3 | #3 | #3 | #2 | PASS |
 | 4 | wireguard | 1.9 | #5 | #4 | #4 | #3 | PASS |
-| 5 | frp | 1.6 | #4 | #5 | #5 | #4 | PASS |
+| 5 | frp | 1.35 | #4 | #5 | #5 | #5 | PASS |
 
 Score weights: saturation throughput 35%, small-response request rate 20%, p50 latency 20%, error rate 25%. A correctness failure ranks last on reliability.
 
@@ -487,7 +512,7 @@ Score weights: saturation throughput 35%, small-response request rate 20%, p50 l
 | Rank | Target | Peak MiB/s | At connections | p50 ms | p99 ms |
 | ---: | --- | ---: | ---: | ---: | ---: |
 | 1 | direct | 20427.29 | 1000 | 2.15 | 8.82 |
-| 2 | cathole | 3576.19 | 64 | 1.05 | 2.16 |
+| 2 | cathole | 3698.86 | 256 | 4.47 | 8.6 |
 | 3 | rathole | 2582.68 | 1000 | 17.07 | 211.75 |
 | 4 | frp | 245.63 | 256 | 63.19 | 199.91 |
 | 5 | wireguard | 53.01 | 1000 | 739.21 | 5446.71 |
@@ -497,7 +522,7 @@ Score weights: saturation throughput 35%, small-response request rate 20%, p50 l
 | Rank | Target | Latency RPS | p50 ms | p99 ms | Stress RPS |
 | ---: | --- | ---: | ---: | ---: | ---: |
 | 1 | direct | 353092 | 0.16 | 0.41 | 827651 |
-| 2 | cathole | 104828 | 0.59 | 1 | 188758 |
+| 2 | cathole | 110741 | 0.6 | 1.01 | 186271 |
 | 3 | rathole | 100766 | 0.61 | 1.25 | 196391 |
 | 4 | wireguard | 40978 | 1.56 | 2.18 | 45942 |
 | 5 | frp | 9782 | 6.62 | 8.33 | 8984 |
@@ -509,21 +534,21 @@ Score weights: saturation throughput 35%, small-response request rate 20%, p50 l
 | 1 | direct | PASS | 0% | 674 | 0 | 0 | 0 | 0 |
 | 2 | rathole | PASS | 0% | 256 | 0 | 0 | 0 | 0 |
 | 3 | wireguard | PASS | 0% | 67 | 0 | 0 | 0 | 0 |
-| 4 | frp | PASS | 0.02% | 64 | 0 | 0 | 0 | 0 |
-| 5 | cathole | PASS | 0.02% | 1238 | 0 | 0 | 0 | 0 |
+| 4 | cathole | PASS | 0.01% | 639 | 0 | 0 | 0 | 0 |
+| 5 | frp | PASS | 0.02% | 64 | 0 | 0 | 0 | 0 |
 
 ## wrk results
 
 | Test | Target | Connections | Requests/s | Transfer MiB/s | p50 ms | p95 ms | p99 ms | Errors |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| latency | cathole | 64 | 104828 | 14.29 | 0.59 | 0.86 | 1 | 0 |
+| latency | cathole | 64 | 110741 | 15.1 | 0.6 | 0.86 | 1.01 | 127 |
 | latency | direct | 64 | 353092 | 48.15 | 0.16 | 0.29 | 0.41 | 62 |
 | latency | frp | 64 | 9782 | 1.33 | 6.62 | 7.72 | 8.33 | 64 |
 | latency | rathole | 64 | 100766 | 13.74 | 0.61 | 0.91 | 1.25 | 0 |
 | latency | wireguard | 64 | 40978 | 5.58 | 1.56 | 1.82 | 2.18 | 64 |
-| saturation | cathole | 64 | 57093 | 3576.19 | 1.05 | 1.69 | 2.16 | 0 |
-| saturation | cathole | 256 | 55545 | 3479.23 | 4.46 | 7.28 | 9.18 | 256 |
-| saturation | cathole | 1000 | 51966 | 3255.11 | 17.49 | 31.17 | 39.64 | 0 |
+| saturation | cathole | 64 | 57307 | 3589.56 | 1.05 | 1.68 | 2.08 | 0 |
+| saturation | cathole | 256 | 59052 | 3698.86 | 4.47 | 7.21 | 8.6 | 512 |
+| saturation | cathole | 1000 | 51451 | 3222.83 | 17.48 | 30.88 | 37.91 | 0 |
 | saturation | direct | 64 | 235090 | 14725.45 | 0.23 | 0.52 | 0.8 | 0 |
 | saturation | direct | 256 | 302314 | 18936.16 | 0.66 | 1.64 | 2.46 | 0 |
 | saturation | direct | 1000 | 326120 | 20427.29 | 2.15 | 6.2 | 8.82 | 612 |
@@ -536,7 +561,7 @@ Score weights: saturation throughput 35%, small-response request rate 20%, p50 l
 | saturation | wireguard | 64 | 834 | 52.33 | 64.43 | 131.74 | 437.27 | 0 |
 | saturation | wireguard | 256 | 829 | 52.71 | 271.57 | 586.93 | 863.61 | 3 |
 | saturation | wireguard | 1000 | 796 | 53.01 | 739.21 | 3127.86 | 5446.71 | 0 |
-| stress | cathole | 1000 | 188758 | 25.74 | 4.97 | 8.74 | 10.95 | 982 |
+| stress | cathole | 1000 | 186271 | 25.4 | 5.01 | 8.7 | 10.59 | 0 |
 | stress | direct | 1000 | 827651 | 112.87 | 0.88 | 3.25 | 5.46 | 0 |
 | stress | frp | 1000 | 8984 | 1.22 | 42.13 | 2095.86 | 5916.1 | 0 |
 | stress | rathole | 1000 | 196391 | 26.78 | 4.74 | 8.25 | 66.28 | 0 |
@@ -549,7 +574,7 @@ One HTTP/1.1 GET of a generated 10 GiB `video/mp4` body on a single connection, 
 | Rank | Target | MiB/s | Seconds | TTFB s | Complete |
 | ---: | --- | ---: | ---: | ---: | --- |
 | 1 | direct | 4452.17 | 2.29 | 0 | PASS |
-| 2 | cathole | 736.69 | 13.9 | 0 | PASS |
+| 2 | cathole | 676.8 | 15.13 | 0 | PASS |
 | 3 | rathole | 261.49 | 39.15 | 0 | PASS |
 | 4 | frp | 185.77 | 55.12 | 0 | PASS |
 | 5 | wireguard | 54.01 | 189.57 | 0 | PASS |
@@ -557,8 +582,8 @@ One HTTP/1.1 GET of a generated 10 GiB `video/mp4` body on a single connection, 
 | Target | Seek (16 x 8 MiB Range) | Seek MiB/s |
 | --- | --- | ---: |
 | direct | PASS | 673.68 |
-| rathole | PASS | 150.58 |
 | cathole | PASS | 492.3 |
+| rathole | PASS | 150.58 |
 | wireguard | PASS | 52.24 |
 | frp | PASS | 156.09 |
 
